@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Salamander RS
+Comment=Dvoupanelový správce souborů
+Exec=salamander-rs
+Icon=salamander-rs
+Terminal=false
+Categories=System;FileTools;FileManager;

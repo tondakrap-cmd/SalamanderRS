@@ -1,0 +1,27 @@
+[package]
+name = "salamander-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "GPL-3.0-or-later"
+description = "Dual-pane file manager for Ubuntu, inspired by Open Salamander"
+authors = ["Salamander RS contributors"]
+
+[dependencies]
+gtk = { package = "gtk4", version = "0.11", features = ["v4_12"] }
+async-channel = "2"
+trash = "5"
+chrono = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+
+[package.metadata.deb]
+depends = "$auto, xdg-utils"
+section = "utils"
+priority = "optional"
+assets = [
+    ["target/release/salamander-rs", "usr/bin/", "755"],
+    ["assets/cz.k4.salamander-rs.desktop", "usr/share/applications/", "644"],
+    ["assets/salamander-rs.svg", "usr/share/icons/hicolor/scalable/apps/salamander-rs.svg", "644"],
+]

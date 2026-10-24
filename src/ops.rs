@@ -596,6 +596,9 @@ where
             if let Err(error) = fs::set_permissions(target, metadata.permissions()) {
                 self.fail(top, source, Some(target), error.to_string());
                 ok = false;
+            } else if let Err(error) = preserve_times(metadata, target) {
+                self.fail(top, source, Some(target), error);
+                ok = false;
             }
         }
         ok
@@ -679,6 +682,9 @@ where
             self.fail(top, source, Some(target), error.to_string());
             return false;
         }
+        if let Ok(metadata) = fs::symlink_metadata(source) {
+            let _ = preserve_times(&metadata, target);
+        }
         self.done_files = self.done_files.saturating_add(1);
         self.progress(source);
         true
@@ -701,6 +707,9 @@ where
             if ok && !self.is_cancelled() {
                 if let Err(error) = fs::set_permissions(&staging, metadata.permissions()) {
                     self.fail(top, source, Some(target), error.to_string());
+                    ok = false;
+                } else if let Err(error) = preserve_times(metadata, &staging) {
+                    self.fail(top, source, Some(target), error);
                     ok = false;
                 }
             }
@@ -778,8 +787,10 @@ where
                         if self.copy_file_contents(source, target, &mut input, output, top) {
                             if let Err(error) =
                                 fs::set_permissions(&staging, metadata.permissions())
+                                    .map_err(|error| error.to_string())
+                                    .and_then(|()| preserve_times(metadata, &staging))
                             {
-                                self.fail(top, source, Some(target), error.to_string());
+                                self.fail(top, source, Some(target), error);
                                 if let Err(cleanup) = remove_if_exists(&staging) {
                                     self.fail(top, source, Some(target), cleanup);
                                 }
@@ -889,15 +900,19 @@ where
     }
 
     fn finish_file(&mut self, source: &Path, target: &Path, top: &mut TopState) -> bool {
-        let permissions = match fs::symlink_metadata(source) {
-            Ok(metadata) => metadata.permissions(),
+        let metadata = match fs::symlink_metadata(source) {
+            Ok(metadata) => metadata,
             Err(error) => {
                 self.fail(top, source, Some(target), error.to_string());
                 return false;
             }
         };
-        if let Err(error) = fs::set_permissions(target, permissions) {
+        if let Err(error) = fs::set_permissions(target, metadata.permissions()) {
             self.fail(top, source, Some(target), error.to_string());
+            return false;
+        }
+        if let Err(error) = preserve_times(&metadata, target) {
+            self.fail(top, source, Some(target), error);
             return false;
         }
         self.done_files = self.done_files.saturating_add(1);
@@ -974,6 +989,69 @@ fn unsupported(metadata: &fs::Metadata) -> bool {
 fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn preserve_times(source: &fs::Metadata, target: &Path) -> Result<(), String> {
+    crate::sys::set_times(target, source.accessed().ok(), source.modified().ok())
+        .map_err(|error| format!("Nelze nastavit časy: {error}"))
+}
+
+/// Recursive size of a file or directory tree; symlinks are counted but not followed.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Measure {
+    pub files: u64,
+    /// Directories below the measured roots (the roots themselves are not counted).
+    pub dirs: u64,
+    pub bytes: u64,
+    pub errors: u64,
+}
+
+impl Measure {
+    pub fn add(&mut self, other: Measure) {
+        self.files += other.files;
+        self.dirs += other.dirs;
+        self.bytes += other.bytes;
+        self.errors += other.errors;
+    }
+}
+
+pub fn measure(path: &Path, cancel: &AtomicBool) -> Measure {
+    let mut total = Measure::default();
+    let mut stack = vec![(path.to_path_buf(), true)];
+    while let Some((current, is_root)) = stack.pop() {
+        if cancel.load(Ordering::Relaxed) {
+            break;
+        }
+        let metadata = match fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                total.errors += 1;
+                continue;
+            }
+        };
+        if !metadata.is_dir() {
+            total.files += 1;
+            if metadata.is_file() {
+                total.bytes += metadata.len();
+            }
+            continue;
+        }
+        if !is_root {
+            total.dirs += 1;
+        }
+        match fs::read_dir(&current) {
+            Ok(entries) => {
+                for entry in entries {
+                    match entry {
+                        Ok(entry) => stack.push((entry.path(), false)),
+                        Err(_) => total.errors += 1,
+                    }
+                }
+            }
+            Err(_) => total.errors += 1,
+        }
+    }
+    total
 }
 
 fn remove_source(path: &Path) -> Result<(), String> {
@@ -1464,6 +1542,46 @@ mod tests {
         drop(events_rx);
         handle.join().unwrap();
         assert_eq!(fs::read_to_string(dest.join("source.txt")).unwrap(), "old");
+    }
+
+    #[test]
+    fn copy_preserves_modification_time() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = TempDir::new().unwrap();
+        let source = temp.path().join("tree");
+        let dest = temp.path().join("dest");
+        fs::create_dir(&source).unwrap();
+        fs::create_dir(&dest).unwrap();
+        fs::write(source.join("file"), "x").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_234_567_890);
+        crate::sys::set_times(&source.join("file"), None, Some(old)).unwrap();
+        crate::sys::set_times(&source, None, Some(old)).unwrap();
+
+        let result = run(copy(vec![source], &dest), |_| ConflictAction::Abort);
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(fs::metadata(dest.join("tree/file")).unwrap().mtime(), 1_234_567_890);
+        assert_eq!(fs::metadata(dest.join("tree")).unwrap().mtime(), 1_234_567_890);
+    }
+
+    #[test]
+    fn measure_counts_tree_without_following_symlinks() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("tree");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("one"), "12345").unwrap();
+        fs::write(root.join("a/b/two"), "123").unwrap();
+        std::os::unix::fs::symlink("/", root.join("a/root-link")).unwrap();
+
+        let measured = measure(&root, &AtomicBool::new(false));
+        assert_eq!(
+            measured,
+            Measure {
+                files: 3,
+                dirs: 2,
+                bytes: 8,
+                errors: 0
+            }
+        );
     }
 
     #[test]

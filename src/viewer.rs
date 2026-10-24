@@ -1,9 +1,13 @@
+use std::cell::{Cell, RefCell};
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::Path;
+use std::rc::Rc;
 
 use gtk::glib;
 use gtk::prelude::*;
+
+use crate::model::format_bytes;
 
 const MAX_BYTES: usize = 10 * 1024 * 1024;
 const MAX_HEX_BYTES: usize = 64 * 1024;
@@ -13,9 +17,17 @@ struct Rendered {
     status: &'static str,
 }
 
+struct ViewerState {
+    data: RefCell<Vec<u8>>,
+    hex: Cell<bool>,
+    file_size: u64,
+}
+
+/// Opens the internal viewer. Keys: Esc closes, Ctrl+F/F7 search, F3/Shift+F3 next/previous,
+/// H toggles text/hex, W toggles line wrapping.
 pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => {}
+    let file_size = match fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.len(),
         Ok(_) => {
             show_error(
                 parent,
@@ -33,14 +45,14 @@ pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
             );
             return;
         }
-    }
+    };
 
     let window = gtk::Window::builder()
         .transient_for(parent)
         .modal(false)
         .title(format!("Prohlížeč — {}", path.to_string_lossy()))
-        .default_width(800)
-        .default_height(600)
+        .default_width(900)
+        .default_height(650)
         .build();
     let content = gtk::Box::new(gtk::Orientation::Vertical, 6);
     content.set_margin_top(6);
@@ -48,9 +60,24 @@ pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
     content.set_margin_start(6);
     content.set_margin_end(6);
 
+    let search_box = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let search_entry = gtk::SearchEntry::new();
+    search_entry.set_hexpand(true);
+    search_entry.set_placeholder_text(Some("Hledat (Enter/F3 další, Shift+F3 předchozí)"));
+    let previous = gtk::Button::from_icon_name("go-up-symbolic");
+    previous.set_tooltip_text(Some("Předchozí (Shift+F3)"));
+    let next = gtk::Button::from_icon_name("go-down-symbolic");
+    next.set_tooltip_text(Some("Další (F3)"));
+    search_box.append(&search_entry);
+    search_box.append(&previous);
+    search_box.append(&next);
+    let revealer = gtk::Revealer::new();
+    revealer.set_child(Some(&search_box));
+    content.append(&revealer);
+
     let text_view = gtk::TextView::new();
     text_view.set_editable(false);
-    text_view.set_cursor_visible(false);
+    text_view.set_cursor_visible(true);
     text_view.set_monospace(true);
     let buffer = text_view.buffer();
     let scrolled = gtk::ScrolledWindow::new();
@@ -63,6 +90,164 @@ pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
     content.append(&status);
     window.set_child(Some(&content));
 
+    let state = Rc::new(ViewerState {
+        data: RefCell::new(Vec::new()),
+        hex: Cell::new(false),
+        file_size,
+    });
+
+    let render = {
+        let state = Rc::clone(&state);
+        let buffer = buffer.downgrade();
+        let status = status.downgrade();
+        let text_view = text_view.downgrade();
+        move || {
+            let (Some(buffer), Some(status), Some(text_view)) =
+                (buffer.upgrade(), status.upgrade(), text_view.upgrade())
+            else {
+                return;
+            };
+            let data = state.data.borrow();
+            let rendered = if state.hex.get() {
+                Rendered {
+                    text: hex_dump(&data[..data.len().min(MAX_HEX_BYTES)]),
+                    status: "Hexadecimální výpis",
+                }
+            } else {
+                render_content(&data)
+            };
+            buffer.set_text(&rendered.text);
+            buffer.place_cursor(&buffer.start_iter());
+            let wrap = match text_view.wrap_mode() {
+                gtk::WrapMode::None => "",
+                _ => ", zalamování",
+            };
+            status.set_text(&format!(
+                "{} — {}{wrap}   (H text/hex, W zalamování, Ctrl+F hledat, Esc zavřít)",
+                rendered.status,
+                format_bytes(state.file_size)
+            ));
+        }
+    };
+    let render = Rc::new(render);
+
+    let find = {
+        let buffer = buffer.downgrade();
+        let text_view = text_view.downgrade();
+        let search_entry = search_entry.downgrade();
+        move |forward: bool| {
+            let (Some(buffer), Some(text_view), Some(search_entry)) =
+                (buffer.upgrade(), text_view.upgrade(), search_entry.upgrade())
+            else {
+                return;
+            };
+            let needle = search_entry.text();
+            if needle.is_empty() {
+                return;
+            }
+            let flags = gtk::TextSearchFlags::CASE_INSENSITIVE | gtk::TextSearchFlags::TEXT_ONLY;
+            let (start, end) = buffer
+                .selection_bounds()
+                .unwrap_or_else(|| {
+                    let cursor = buffer.iter_at_mark(&buffer.get_insert());
+                    (cursor, cursor)
+                });
+            let found = if forward {
+                end.forward_search(&needle, flags, None)
+                    .or_else(|| buffer.start_iter().forward_search(&needle, flags, None))
+            } else {
+                start
+                    .backward_search(&needle, flags, None)
+                    .or_else(|| buffer.end_iter().backward_search(&needle, flags, None))
+            };
+            match found {
+                Some((mut match_start, match_end)) => {
+                    buffer.select_range(&match_start, &match_end);
+                    text_view.scroll_to_iter(&mut match_start, 0.1, false, 0.0, 0.0);
+                }
+                None => text_view.error_bell(),
+            }
+        }
+    };
+    let find = Rc::new(find);
+
+    {
+        let find = Rc::clone(&find);
+        search_entry.connect_activate(move |_| find(true));
+    }
+    {
+        let find = Rc::clone(&find);
+        next.connect_clicked(move |_| find(true));
+    }
+    {
+        let find = Rc::clone(&find);
+        previous.connect_clicked(move |_| find(false));
+    }
+
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    {
+        let weak_window = window.downgrade();
+        let revealer = revealer.downgrade();
+        let search_entry = search_entry.downgrade();
+        let text_view_weak = text_view.downgrade();
+        let state = Rc::clone(&state);
+        let render = Rc::clone(&render);
+        let find = Rc::clone(&find);
+        keys.connect_key_pressed(move |_, key, _, modifiers| {
+            use gtk::gdk::{Key, ModifierType};
+            let ctrl = modifiers.contains(ModifierType::CONTROL_MASK);
+            let shift = modifiers.contains(ModifierType::SHIFT_MASK);
+            let in_search = search_entry
+                .upgrade()
+                .is_some_and(|entry| entry.has_focus() || entry.focus_child().is_some());
+            match key {
+                Key::Escape => {
+                    if in_search {
+                        if let (Some(revealer), Some(view)) =
+                            (revealer.upgrade(), text_view_weak.upgrade())
+                        {
+                            revealer.set_reveal_child(false);
+                            view.grab_focus();
+                        }
+                    } else if let Some(window) = weak_window.upgrade() {
+                        window.close();
+                    }
+                    glib::Propagation::Stop
+                }
+                Key::f if ctrl => {
+                    show_search(&revealer, &search_entry);
+                    glib::Propagation::Stop
+                }
+                Key::F7 => {
+                    show_search(&revealer, &search_entry);
+                    glib::Propagation::Stop
+                }
+                Key::F3 => {
+                    find(!shift);
+                    glib::Propagation::Stop
+                }
+                Key::h | Key::H if !ctrl && !in_search => {
+                    state.hex.set(!state.hex.get());
+                    render();
+                    glib::Propagation::Stop
+                }
+                Key::w | Key::W if !ctrl && !in_search => {
+                    if let Some(view) = text_view_weak.upgrade() {
+                        view.set_wrap_mode(match view.wrap_mode() {
+                            gtk::WrapMode::None => gtk::WrapMode::WordChar,
+                            _ => gtk::WrapMode::None,
+                        });
+                    }
+                    render();
+                    glib::Propagation::Stop
+                }
+                _ => glib::Propagation::Proceed,
+            }
+        });
+    }
+    window.add_controller(keys);
+
     let path = path.to_path_buf();
     let error_path = path.clone();
     let (sender, receiver) = async_channel::bounded(1);
@@ -72,25 +257,19 @@ pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
     });
 
     let weak_window = window.downgrade();
-    let weak_buffer = buffer.downgrade();
-    let weak_status = status.downgrade();
     let weak_parent = parent.downgrade();
     glib::spawn_future_local(async move {
         let Ok(result) = receiver.recv().await else {
             return;
         };
-        let (Some(window), Some(buffer), Some(status)) = (
-            weak_window.upgrade(),
-            weak_buffer.upgrade(),
-            weak_status.upgrade(),
-        ) else {
+        let Some(window) = weak_window.upgrade() else {
             return;
         };
         match result {
             Ok(data) => {
-                let rendered = render_content(&data);
-                buffer.set_text(&rendered.text);
-                status.set_text(rendered.status);
+                // Text mode falls back to a hex dump by itself for binary data.
+                *state.data.borrow_mut() = data;
+                render();
             }
             Err(error) => {
                 window.close();
@@ -108,6 +287,14 @@ pub fn open(parent: &gtk::ApplicationWindow, path: &Path) {
     });
 
     window.present();
+    text_view.grab_focus();
+}
+
+fn show_search(revealer: &glib::WeakRef<gtk::Revealer>, entry: &glib::WeakRef<gtk::SearchEntry>) {
+    if let (Some(revealer), Some(entry)) = (revealer.upgrade(), entry.upgrade()) {
+        revealer.set_reveal_child(true);
+        entry.grab_focus();
+    }
 }
 
 fn read_limited(reader: impl Read) -> io::Result<Vec<u8>> {

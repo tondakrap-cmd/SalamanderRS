@@ -1,8 +1,14 @@
 [Desktop Entry]
 Type=Application
 Name=Salamander RS
-Comment=Dvoupanelový správce souborů
-Exec=salamander-rs
+GenericName=File Manager
+GenericName[cs]=Správce souborů
+Comment=Dual-pane file manager inspired by Open Salamander
+Comment[cs]=Dvoupanelový správce souborů
+Exec=salamander-rs %U
 Icon=salamander-rs
 Terminal=false
-Categories=System;FileTools;FileManager;
+Categories=System;FileTools;FileManager;Utility;Core;GTK;
+MimeType=inode/directory;
+Keywords=files;file manager;commander;salamander;
+StartupWMClass=cz.k4.salamander-rs

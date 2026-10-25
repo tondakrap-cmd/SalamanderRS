@@ -158,6 +158,7 @@ pub fn unpack_dialog(
     message: &str,
     dest: &Path,
     offer_subfolder: bool,
+    confirm_label: &str,
     on_confirm: impl FnOnce(UnpackOptions) + 'static,
 ) {
     let (window, content) = dialog_window(parent, title);
@@ -177,7 +178,7 @@ pub fn unpack_dialog(
     }
     let overwrite = gtk::CheckButton::with_mnemonic("_Přepsat existující soubory");
     content.append(&overwrite);
-    let (row, confirm) = buttons(&window, "_Rozbalit");
+    let (row, confirm) = buttons(&window, confirm_label);
     content.append(&row);
 
     let callback = Rc::new(RefCell::new(Some(on_confirm)));

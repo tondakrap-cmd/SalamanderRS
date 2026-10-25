@@ -62,6 +62,34 @@ Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
 - seznam, přidání, úprava a mazání xattr (text i binární hodnoty `0x…`)
 - kopírování zachovává uživatelské xattr i ACL
 
+**Vzdálené servery (SSH/SFTP)**
+- databáze serverů (Ctrl+K): adresa, port, uživatel, způsob ověření (automaticky, heslo,
+  klíč), soubor s klíčem, počáteční adresář a další volby ssh (např. `-o ProxyJump=…`);
+  servery jsou i v nabídce Alt+F1/Alt+F2
+- vzdálený adresář se otevře v panelu jako `sftp://uživatel@server/cesta`:
+  F5/F6 stahuje a nahrává (rekurzivně, se zachováním časů a práv), F3 zobrazí,
+  F4 upraví kopii a každé uložení nahraje zpět, F2, F7, Shift+F4, F8, Ctrl+F2 (chmod),
+  Ctrl+T otevře terminál se SSH přímo v aktuálním adresáři
+- spojení obstarává systémový OpenSSH (`ssh -s sftp`), takže fungují `~/.ssh/config`,
+  ssh-agent, klíče i ProxyJump; protokol SFTP je stejný, jaký používá moderní `scp`;
+  další přenosy sdílejí ověřené spojení (ControlMaster), heslo se nezadává znovu
+- neznámý klíč serveru je nutné výslovně potvrdit (zobrazí se otisk), změněný klíč ssh odmítne
+
+**Ukládání hesel** — volitelné, pro každý server zvlášť
+- hesla jsou v trezoru `~/.config/salamander-rs/vault` (práva 0600), každé zvlášť zašifrované
+  XChaCha20-Poly1305 a svázané s id serveru; klíč se odvozuje z hlavního hesla pomocí
+  Argon2id (libsodium, profil „moderate“, 256 MiB), hlavní heslo se nikam neukládá
+- odemčený klíč je jen v paměti (uzamčené stránky, při zamčení se přepíše nulami);
+  trezor se zamkne po 15 minutách nečinnosti, při ukončení nebo ručně (Vzdálené → Zamknout)
+- heslo se do `ssh` předává přes SSH_ASKPASS a soukromý Unix socket s jednorázovým tokenem —
+  nikdy na příkazové řádce, v proměnných prostředí ani v souboru
+- seznam serverů (`~/.config/salamander-rs/servers`) hesla neobsahuje
+
+**Log vzdálených operací** — `~/.local/state/salamander-rs/remote.log` (0600, rotace po 5 MiB):
+připojení a odpojení, žádosti o ověření, přijetí či odmítnutí klíče serveru s otiskem,
+výpisy adresářů, každé stažení, nahrání, smazání, přejmenování, chmod a chyby; nikdy hesla.
+Zobrazí se přes Vzdálené → Log vzdálených operací.
+
 **Prohlížeč (F3)** — text/hex (H), zalamování (W), hledání (Ctrl+F, F3/Shift+F3), Esc zavře.
 
 Úplný přehled kláves je v aplikaci pod F1.
@@ -71,7 +99,7 @@ Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
 Na Ubuntu 24.04+ (nebo ve WSL2 s WSLg):
 
 ```bash
-sudo apt install build-essential pkg-config libgtk-4-dev libarchive13t64
+sudo apt install build-essential pkg-config libgtk-4-dev libarchive13t64 libsodium23 openssh-client
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust ≥ 1.85
 cargo test
 cargo run -- ~/Dokumenty        # volitelně adresář pro levý panel
@@ -87,6 +115,13 @@ sudo apt install ./target/debian/salamander-rs_*_amd64.deb
 
 Nastavení (poslední adresáře, velikost okna, sloupce, klávesové cesty) se ukládá
 do `~/.config/salamander-rs/config`.
+
+### Testy vzdálených funkcí
+
+Testy SFTP potřebují `sftp-server` a testy spojení neprivilegovaný `sshd` na 127.0.0.1:2222
+s klíčem `~/srs-sshtest/client_ed25519` (bez nich se přeskočí). Stačí rozbalit balíčky
+`openssh-server` a `openssh-sftp-server` (`dpkg-deb -x … ~/srs-sshtest/root`) a spustit
+`sshd -f` s vlastní konfigurací (`UsePAM no`, `HostKey` a `AuthorizedKeysFile` v témže adresáři).
 
 ## Licence
 

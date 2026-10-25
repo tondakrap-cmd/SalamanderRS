@@ -1,6 +1,7 @@
 fn main() {
-    // Link libarchive by its stable soname so only the runtime package (libarchive13) is
-    // needed, not libarchive-dev with its unversioned libarchive.so symlink.
+    // Link system libraries by their stable sonames so only the runtime packages
+    // (libarchive13, libsodium23) are needed, not the -dev packages with unversioned symlinks.
     println!("cargo:rustc-link-lib=dylib:+verbatim=libarchive.so.13");
+    println!("cargo:rustc-link-lib=dylib:+verbatim=libsodium.so.23");
     println!("cargo:rerun-if-changed=build.rs");
 }

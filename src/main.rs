@@ -10,7 +10,11 @@ mod ops;
 mod panel;
 mod places;
 mod props;
+mod remote;
+mod remote_ui;
+mod sodium;
 mod sys;
+mod vault;
 mod viewer;
 mod window;
 mod xattr;
@@ -20,6 +24,10 @@ use std::path::PathBuf;
 use gtk::prelude::*;
 
 fn main() -> gtk::glib::ExitCode {
+    // ssh runs this binary as its SSH_ASKPASS helper; answer and exit before starting GTK.
+    if let Some(code) = remote::askpass::askpass_main() {
+        std::process::exit(code);
+    }
     // `salamander-rs DIR` (or a file:// URI from a file manager) opens DIR in the left panel.
     let open_dir = std::env::args_os().nth(1).map(|arg| {
         let text = arg.to_string_lossy();

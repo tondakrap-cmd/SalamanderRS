@@ -44,6 +44,8 @@ pub enum OptionalColumn {
 pub enum Location {
     Dir(PathBuf),
     Archive { archive: PathBuf, inner: PathBuf },
+    /// Directory on an SSH server; `path` is the absolute remote path.
+    Remote { id: String, path: PathBuf },
 }
 
 impl Location {
@@ -54,6 +56,15 @@ impl Location {
             Location::Dir(dir) => dir.clone(),
             Location::Archive { archive, inner } if inner.as_os_str().is_empty() => archive.clone(),
             Location::Archive { archive, inner } => archive.join(inner),
+            Location::Remote { id, path } => crate::remote::virtual_path(id, path),
+        }
+    }
+
+    /// Text for the path entry; remote locations show `sftp://user@host/path`.
+    pub fn entry_text(&self) -> String {
+        match self {
+            Location::Remote { id, path } => crate::remote::pretty(id, path),
+            other => other.display().to_string_lossy().into_owned(),
         }
     }
 
@@ -64,6 +75,10 @@ impl Location {
             Location::Archive { archive, .. } => archive
                 .parent()
                 .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/")),
+            // Remote panels have no local directory; callers must check for them first.
+            Location::Remote { .. } => env::var_os("HOME")
+                .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("/")),
         }
     }
@@ -393,9 +408,26 @@ impl Panel {
     pub fn archive(&self) -> Option<(PathBuf, PathBuf)> {
         match &self.state.borrow().location {
             Location::Archive { archive, inner } => Some((archive.clone(), inner.clone())),
-            Location::Dir(_) => None,
+            _ => None,
         }
     }
+
+    /// `(server id, remote directory)` when the panel shows a remote server.
+    pub fn remote(&self) -> Option<(String, PathBuf)> {
+        match &self.state.borrow().location {
+            Location::Remote { id, path } => Some((id.clone(), path.clone())),
+            _ => None,
+        }
+    }
+
+    /// Absolute remote paths of the selected entries in a remote panel.
+    pub fn remote_selection(&self) -> Vec<PathBuf> {
+        self.selected_or_cursor()
+            .iter()
+            .filter_map(|path| crate::remote::split_virtual(path).map(|(_, remote)| remote))
+            .collect()
+    }
+
 
     /// Inner paths of the selected entries when the panel shows an archive.
     pub fn archive_selection(&self) -> Vec<PathBuf> {
@@ -476,6 +508,11 @@ impl Panel {
     pub fn navigate_parent(&self) {
         // Inside an archive the parent of the archive root is the directory containing the
         // archive file, with the cursor on it — the same as for ordinary directories.
+        if let Some((_, path)) = self.remote() {
+            if path == Path::new("/") {
+                return;
+            }
+        }
         let current = {
             let state = self.state.borrow();
             state.loading.as_ref().unwrap_or(&state.location).display()
@@ -575,6 +612,26 @@ impl Panel {
         self.state.borrow_mut().pending_cursor = None;
         self.quick_search_end();
 
+        // Remote locations: internal virtual paths or typed `sftp://user@host/path`.
+        let typed = requested.to_string_lossy();
+        if typed.starts_with(crate::remote::SCHEME) || self.remote().is_some() && !requested.is_absolute() {
+            let candidate = self.resolve_path(requested);
+            let remote = crate::remote::split_virtual(&candidate)
+                .filter(|(id, _)| crate::remote::conn::get(id).is_some())
+                .or_else(|| crate::remote::resolve_typed(&typed));
+            let Some((id, path)) = remote else {
+                self.fail_navigation(&format!("Server {typed} není připojen"));
+                return;
+            };
+            let location = Location::Remote { id, path };
+            if let Some(name) = focus.and_then(Path::file_name) {
+                let display = location.display();
+                self.state.borrow_mut().pending_cursor = Some((display.clone(), display.join(name)));
+            }
+            let show_hidden = self.state.borrow().show_hidden;
+            self.load(location, show_hidden, false);
+            return;
+        }
         let candidate = self.resolve_path(requested);
         let location = match fs::canonicalize(&candidate) {
             Ok(path) if path.is_dir() => Location::Dir(path),
@@ -911,7 +968,7 @@ impl Panel {
         let generation = self.state.borrow().generation.get().wrapping_add(1);
         self.state.borrow().generation.set(generation);
         self.state.borrow_mut().loading = Some(location.clone());
-        self.path_entry.set_text(&location.display().to_string_lossy());
+        self.path_entry.set_text(&location.entry_text());
 
         let (sender, receiver) = async_channel::bounded(1);
         let worker_location = location.clone();
@@ -921,6 +978,7 @@ impl Panel {
                 Location::Archive { archive, inner } => {
                     read_archive_directory(archive, inner, show_hidden)
                 }
+                Location::Remote { id, path } => crate::remote::read_directory(id, path, show_hidden),
             };
             let _ = sender.send_blocking((generation, worker_location, result));
         });
@@ -1012,10 +1070,10 @@ impl Panel {
                 }
             }
         }
-        self.path_entry.set_text(&dir.to_string_lossy());
+        self.path_entry.set_text(&location.entry_text());
         match &location {
             Location::Dir(real) => self.watch_directory(real),
-            Location::Archive { .. } => self.unwatch(),
+            Location::Archive { .. } | Location::Remote { .. } => self.unwatch(),
         }
 
         let pending_path = {
@@ -1221,8 +1279,8 @@ impl Panel {
     }
 
     fn restore_path_entry(&self) {
-        let dir = self.state.borrow().location.display();
-        self.path_entry.set_text(&dir.to_string_lossy());
+        let text = self.state.borrow().location.entry_text();
+        self.path_entry.set_text(&text);
     }
 
     fn show_message(&self, message: &str) {

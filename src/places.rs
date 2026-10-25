@@ -12,11 +12,13 @@ use gtk::glib;
 use gtk::prelude::*;
 
 use crate::model::format_bytes;
+use crate::remote::servers::Server;
 use crate::sys;
 
 enum Target {
     Path(PathBuf),
     Volume(gio::Volume),
+    Server(Server),
 }
 
 struct Place {
@@ -61,7 +63,7 @@ fn gtk_bookmarks() -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-fn collect_places(hotpaths: &[Option<PathBuf>], history: &[PathBuf]) -> Vec<(String, Vec<Place>)> {
+fn collect_places(hotpaths: &[Option<PathBuf>], history: &[PathBuf], servers: Vec<Server>) -> Vec<(String, Vec<Place>)> {
     let mut sections = Vec::new();
 
     let mut basic = Vec::new();
@@ -117,6 +119,22 @@ fn collect_places(hotpaths: &[Option<PathBuf>], history: &[PathBuf]) -> Vec<(Str
         sections.push(("Svazky".to_owned(), volumes));
     }
 
+    let servers: Vec<Place> = servers
+        .into_iter()
+        .map(|server| {
+            let connected = crate::remote::conn::get(&server.id).is_some();
+            Place {
+                icon: "network-server-symbolic",
+                label: server.display_name(),
+                detail: format!("sftp://{}{}", server.label(), if connected { "   ·   připojeno" } else { "" }),
+                target: Target::Server(server),
+            }
+        })
+        .collect();
+    if !servers.is_empty() {
+        sections.push(("Servery SSH (Ctrl+K spravuje)".to_owned(), servers));
+    }
+
     let bookmarks: Vec<Place> = gtk_bookmarks()
         .into_iter()
         .filter(|(_, path)| !seen.contains(path))
@@ -168,7 +186,9 @@ pub fn open(
     title: &str,
     hotpaths: &[Option<PathBuf>],
     history: &[PathBuf],
+    servers: Vec<Server>,
     on_choose: impl Fn(PathBuf) + 'static,
+    on_server: impl Fn(Server) + 'static,
 ) {
     let window = gtk::Window::builder()
         .transient_for(parent)
@@ -185,7 +205,7 @@ pub fn open(
     window.set_child(Some(&scrolled));
 
     let mut targets: Vec<Option<Target>> = Vec::new();
-    for (title, places) in collect_places(hotpaths, history) {
+    for (title, places) in collect_places(hotpaths, history, servers) {
         let header = gtk::Label::new(Some(&title));
         header.set_xalign(0.0);
         header.add_css_class("heading");
@@ -242,6 +262,10 @@ pub fn open(
             Some(Target::Path(path)) => {
                 window.close();
                 on_choose(path);
+            }
+            Some(Target::Server(server)) => {
+                window.close();
+                on_server(server);
             }
             Some(Target::Volume(volume)) => {
                 let operation = gtk::MountOperation::new(Some(&window));

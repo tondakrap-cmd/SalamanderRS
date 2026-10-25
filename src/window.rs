@@ -27,6 +27,10 @@ use crate::places;
 use crate::props;
 use crate::viewer;
 
+#[path = "window_remote.rs"]
+mod remote_actions;
+use remote_actions::*;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum WhichPanel {
     Left,
@@ -52,6 +56,11 @@ struct WindowState {
     last_mask: RefCell<String>,
     message: gtk::Label,
     message_generation: Cell<u64>,
+    /// Unlocked password vault key; dropped (and wiped) on lock.
+    vault_key: RefCell<Option<crate::sodium::Key>>,
+    vault_used: Cell<std::time::Instant>,
+    /// Watches on remote files being edited (F4), uploading them on save.
+    remote_edits: RefCell<Vec<gio::FileMonitor>>,
 }
 
 impl WindowState {
@@ -147,6 +156,9 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
         last_mask: RefCell::new("*.*".to_owned()),
         message,
         message_generation: Cell::new(0),
+        vault_key: RefCell::new(None),
+        vault_used: Cell::new(std::time::Instant::now()),
+        remote_edits: RefCell::new(Vec::new()),
     });
 
     let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -160,6 +172,7 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
     connect_panel(&window, &state, WhichPanel::Left);
     connect_panel(&window, &state, WhichPanel::Right);
     install_actions(app, &window, &state);
+    install_vault_autolock(&state);
     if let Some(path) = open_archive {
         state.left.navigate(&path);
     }
@@ -173,6 +186,8 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
             return glib::Propagation::Stop;
         }
         save_config(window, &owned_state);
+        lock_vault(&owned_state);
+        disconnect_all();
         glib::Propagation::Proceed
     });
 
@@ -359,6 +374,23 @@ fn build_menu_bar(_config: &Config) -> gtk::PopoverMenuBar {
     model.append_submenu(Some("_Přejít"), &go_menu);
     model.append_submenu(Some("_Zobrazit"), &view_menu);
     model.append_submenu(Some("_Nástroje"), &tools_menu);
+    let remote_menu = gio::Menu::new();
+    remote_menu.append_section(
+        None,
+        &section(&[
+            ("Připojit k serveru…", "win.servers", None),
+            ("Odpojit", "win.disconnect", None),
+        ]),
+    );
+    remote_menu.append_section(
+        None,
+        &section(&[
+            ("Log vzdálených operací", "win.remote-log", None),
+            ("Zamknout trezor hesel", "win.vault-lock", None),
+            ("Změnit hlavní heslo trezoru…", "win.vault-change", None),
+        ]),
+    );
+    model.append_submenu(Some("_Vzdálené"), &remote_menu);
     model.append_submenu(Some("Nápo_věda"), &help_menu);
     gtk::PopoverMenuBar::from_model(Some(&model))
 }
@@ -635,13 +667,30 @@ fn install_actions(
     let action = |name: &str, accels: &[&str], handler: fn(&gtk::ApplicationWindow, &Rc<WindowState>)| {
         add_window_action(app, window, state, name, accels, handler);
     };
-    // Actions that only make sense on real files are refused inside archives.
+    // Actions that only make sense on real files are refused inside archives and on servers.
     let fs_action = |name: &str, accels: &[&str], handler: fn(&gtk::ApplicationWindow, &Rc<WindowState>)| {
         add_window_action(app, window, state, name, accels, move |window, state| {
-            if state.active_panel().archive().is_some() {
+            if state.active_panel().remote().is_some() {
+                show_error(window, REMOTE_UNSUPPORTED);
+            } else if state.active_panel().archive().is_some() {
                 show_error(window, ARCHIVE_UNSUPPORTED);
             } else {
                 handler(window, state);
+            }
+        });
+    };
+    // Actions with a separate implementation for remote panels; refused inside archives.
+    let routed = |name: &str,
+                  accels: &[&str],
+                  local: fn(&gtk::ApplicationWindow, &Rc<WindowState>),
+                  remote: fn(&gtk::ApplicationWindow, &Rc<WindowState>)| {
+        add_window_action(app, window, state, name, accels, move |window, state| {
+            if state.active_panel().remote().is_some() {
+                remote(window, state);
+            } else if state.active_panel().archive().is_some() {
+                show_error(window, ARCHIVE_UNSUPPORTED);
+            } else {
+                local(window, state);
             }
         });
     };
@@ -745,10 +794,12 @@ fn install_actions(
     }
 
     // File operations.
-    fs_action("rename", &["F2"], begin_rename);
+    routed("rename", &["F2"], begin_rename, remote_rename);
     action("view", &["F3"], |window, state| {
         let panel = state.active_panel();
-        if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
+        if panel.remote().is_some() {
+            remote_view(window, state);
+        } else if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
             if !is_dir {
                 with_extracted(window, archive, inner, |window, path| viewer::open(window, &path));
             }
@@ -758,7 +809,9 @@ fn install_actions(
     });
     action("open-external", &[], |window, state| {
         let panel = state.active_panel();
-        if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
+        if panel.remote().is_some() {
+            remote_open_external(window, state);
+        } else if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
             if !is_dir {
                 with_extracted(window, archive, inner, |window, path| open_file(window, path));
             }
@@ -766,34 +819,44 @@ fn install_actions(
             open_file(window, path);
         }
     });
-    fs_action("edit", &["F4"], |window, state| {
-        if let Some(path) = state.active_panel().cursor_path() {
-            if path.is_dir() {
-                show_error(window, "Adresář nelze upravit; použijte Enter");
-            } else {
-                edit_file(window, &path);
+    routed(
+        "edit",
+        &["F4"],
+        |window, state| {
+            if let Some(path) = state.active_panel().cursor_path() {
+                if path.is_dir() {
+                    show_error(window, "Adresář nelze upravit; použijte Enter");
+                } else {
+                    edit_file(window, &path);
+                }
             }
-        }
-    });
-    fs_action("new-file", &["<Shift>F4"], begin_new_file);
+        },
+        remote_edit,
+    );
+    routed("new-file", &["<Shift>F4"], begin_new_file, remote_new_file);
     action("copy", &["F5"], |window, state| begin_copy_move(window, state, OpKind::Copy));
     action("move", &["F6"], |window, state| begin_copy_move(window, state, OpKind::Move));
-    fs_action("mkdir", &["F7"], begin_mkdir);
+    routed("mkdir", &["F7"], begin_mkdir, remote_mkdir);
     fs_action("symlink", &["<Control><Shift>F5"], begin_symlink);
     fs_action("pack", &["<Alt>F5"], begin_pack);
     action("unpack", &["<Alt>F9"], begin_unpack);
     action("trash", &["F8"], |window, state| begin_removal(window, state, false));
     action("delete", &["<Shift>F8"], |window, state| begin_removal(window, state, true));
     action("properties", &["<Alt>Return"], |window, state| {
-        if state.active_panel().archive().is_some() {
+        if state.active_panel().remote().is_some() {
+            remote_info(window, state);
+        } else if state.active_panel().archive().is_some() {
             show_archive_info(window, state.active_panel());
         } else {
             open_properties(window, state, props::Page::General)
         }
     });
-    fs_action("attributes", &["<Control>F2"], |window, state| {
-        open_properties(window, state, props::Page::Permissions)
-    });
+    routed(
+        "attributes",
+        &["<Control>F2"],
+        |window, state| open_properties(window, state, props::Page::Permissions),
+        remote_chmod,
+    );
     fs_action("calc-size", &["<Alt><Shift>Return"], calculate_size);
 
     // Clipboard.
@@ -815,7 +878,7 @@ fn install_actions(
     });
 
     // Tools and application.
-    action("find", &["<Alt>F7"], |window, state| {
+    fs_action("find", &["<Alt>F7"], |window, state| {
         let weak_state = Rc::downgrade(state);
         let weak_window = window.downgrade();
         find::open(
@@ -840,8 +903,19 @@ fn install_actions(
         );
     });
     action("terminal", &["<Control>t"], |window, state| {
-        open_terminal(window, &state.active_panel().dir())
+        if state.active_panel().remote().is_some() {
+            remote_terminal(window, state);
+        } else {
+            open_terminal(window, &state.active_panel().dir())
+        }
     });
+
+    // Remote servers.
+    action("servers", &["<Control>k"], open_server_manager);
+    action("disconnect", &[], disconnect_active);
+    action("remote-log", &[], |window, _| show_remote_log(window));
+    action("vault-lock", &[], |_, state| lock_vault(state));
+    action("vault-change", &[], change_master);
     action("close", &["<Alt>F4", "<Control>q"], |window, _| window.close());
     action("shortcuts", &["F1"], |window, _| {
         dialogs::info(window, "Klávesové zkratky", SHORTCUTS)
@@ -896,6 +970,12 @@ Archivy (zip, tar.gz/xz/zst/bz2, 7z, rar, iso, deb, …)
 Zobrazení a nástroje
   Ctrl+H skryté soubory, Ctrl+R obnovit, Ctrl+F3…F6 řadit jméno/přípona/čas/velikost
   Alt+F7 hledat soubory, Ctrl+T terminál, Ctrl+Q / Alt+F4 konec
+
+Vzdálené servery (SSH/SFTP)
+  Ctrl+K — správce serverů a připojení; servery jsou i v Alt+F1/Alt+F2
+  F5/F6 — stáhnout nebo nahrát (přesunout); F4 — upravit, uložení se nahraje zpět
+  F2, F7, Shift+F4, F8 — přejmenovat, složka, soubor, smazat; Ctrl+F2 — oprávnění
+  Ctrl+T — terminál se SSH v aktuálním adresáři; Vzdálené → Odpojit, Log, Trezor
 
 Prohlížeč (F3)
   Ctrl+F / F7 hledat, F3 / Shift+F3 další / předchozí, H text/hex, W zalamování, Esc zavřít";
@@ -1029,6 +1109,7 @@ fn begin_extract(
         &format!("Rozbalit {} položek z {} do:", items.len(), archive.to_string_lossy()),
         &dest,
         false,
+        "_Rozbalit",
         move |options| {
             let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
                 return;
@@ -1214,6 +1295,10 @@ fn begin_unpack(window: &gtk::ApplicationWindow, state: &Rc<WindowState>) {
     if state.busy.get() {
         return;
     }
+    if state.active_panel().remote().is_some() {
+        show_error(window, REMOTE_UNSUPPORTED);
+        return;
+    }
     if state.active_panel().archive().is_some() {
         // Inside an archive Alt+F9 extracts the selection, like F5.
         begin_copy_move(window, state, OpKind::Copy);
@@ -1243,6 +1328,7 @@ fn begin_unpack(window: &gtk::ApplicationWindow, state: &Rc<WindowState>) {
         &format!("Rozbalit {} archivů do:", archives.len()),
         &dest,
         true,
+        "_Rozbalit",
         move |options| {
             let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
                 return;
@@ -1353,13 +1439,28 @@ fn open_places(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, which: 
     };
     let hotpaths = state.config.borrow().hotpaths.clone();
     let weak_state = Rc::downgrade(state);
-    places::open(window, title, &hotpaths, &panel.history(), move |path| {
-        panel.navigate(&path);
-        if let Some(state) = weak_state.upgrade() {
-            set_active_panel(&state, which);
-        }
-        panel.view().grab_focus();
-    });
+    let server_state = Rc::downgrade(state);
+    let server_window = window.downgrade();
+    let servers = crate::remote::servers::load(&crate::remote::servers::default_path());
+    places::open(
+        window,
+        title,
+        &hotpaths,
+        &panel.history(),
+        servers,
+        move |path| {
+            panel.navigate(&path);
+            if let Some(state) = weak_state.upgrade() {
+                set_active_panel(&state, which);
+            }
+            panel.view().grab_focus();
+        },
+        move |server| {
+            if let (Some(state), Some(window)) = (server_state.upgrade(), server_window.upgrade()) {
+                connect_server(&window, &state, server, which);
+            }
+        },
+    );
 }
 
 fn set_hotpath(state: &Rc<WindowState>, index: usize) {
@@ -1861,6 +1962,10 @@ fn begin_removal(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, perma
     if state.busy.get() {
         return;
     }
+    if state.active_panel().remote().is_some() {
+        begin_remote_delete(window, state);
+        return;
+    }
     if let Some((archive, _)) = state.active_panel().archive() {
         begin_archive_delete(window, state, archive);
         return;
@@ -1936,6 +2041,20 @@ fn begin_copy_move(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, kin
     }
     let active_archive = state.active_panel().archive();
     let other_archive = state.other_panel().archive();
+    let active_remote = state.active_panel().remote().is_some();
+    let other_remote = state.other_panel().remote().is_some();
+    if active_remote || other_remote {
+        if active_remote && other_remote {
+            show_error(window, "Kopírování mezi dvěma vzdálenými panely není podporováno; použijte místní adresář");
+        } else if active_archive.is_some() || other_archive.is_some() {
+            show_error(window, "Přenos mezi archivem a serverem není podporován; archiv nejprve rozbalte");
+        } else if active_remote {
+            begin_download(window, state, kind);
+        } else {
+            begin_upload(window, state, kind);
+        }
+        return;
+    }
     if kind == OpKind::Move && (active_archive.is_some() || other_archive.is_some()) {
         show_error(window, "Přesun z archivu nebo do archivu není podporován; použijte F5 a potom F8");
         return;
@@ -2287,6 +2406,10 @@ fn run_copy_move(
 }
 
 fn activate_entry(panel: &Panel, window: &gtk::ApplicationWindow) {
+    if panel.remote().is_some() {
+        remote_activate(window, panel);
+        return;
+    }
     if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
         if is_dir {
             panel.navigate(&archive.join(inner));

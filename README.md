@@ -4,7 +4,20 @@ Dvoupanelový správce souborů pro Linux (GTK 4, Rust) inspirovaný
 [Open Salamanderem](https://github.com/OpenSalamander/salamander). Ovládá se hlavně
 z klávesnice. Jde o nezávislou implementaci, kód Open Salamandera nepřebírá.
 
-Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
+Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland), a na AlmaLinux / RHEL 9 a 10
+s GNOME.
+
+## Instalace
+
+Hotové balíčky jsou ke stažení v **[Releases](https://github.com/tondakrap-cmd/SalamanderRS/releases/latest)**:
+
+| Systém | Balíček | Instalace |
+|---|---|---|
+| Ubuntu 24.04+ / Debian | `salamander-rs_<verze>-1_amd64.deb` | `sudo apt install ./salamander-rs_*_amd64.deb` |
+| AlmaLinux / RHEL 9 a 10 | `salamander-rs-<verze>-1.x86_64.rpm` | `sudo dnf install ./salamander-rs-*.x86_64.rpm` |
+
+Závislosti se doinstalují automaticky; RPM nepotřebuje EPEL. Sestavení ze zdrojáků
+popisuje kapitola [Sestavení](#sestavení).
 
 ## Funkce
 

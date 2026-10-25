@@ -18,6 +18,8 @@ pub struct Config {
     pub show_ext_column: bool,
     pub show_permissions_column: bool,
     pub show_owner_column: bool,
+    /// Shows the `..` row leading to the parent directory.
+    pub show_parent_entry: bool,
     pub hotpaths: [Option<PathBuf>; HOTPATH_COUNT],
 }
 
@@ -34,6 +36,7 @@ impl Default for Config {
             show_ext_column: false,
             show_permissions_column: true,
             show_owner_column: false,
+            show_parent_entry: false,
             hotpaths: Default::default(),
         }
     }
@@ -88,6 +91,7 @@ impl Config {
                 "column_ext" => config.show_ext_column = flag(),
                 "column_permissions" => config.show_permissions_column = flag(),
                 "column_owner" => config.show_owner_column = flag(),
+                "parent_entry" => config.show_parent_entry = flag(),
                 _ => {
                     if let Some(index) = key
                         .strip_prefix("hotpath")
@@ -119,7 +123,7 @@ impl Config {
         }
         output.push_str(&format!(
             "show_hidden={}\nwidth={}\nheight={}\nmaximized={}\npaned_position={}\n\
-             column_ext={}\ncolumn_permissions={}\ncolumn_owner={}\n",
+             column_ext={}\ncolumn_permissions={}\ncolumn_owner={}\nparent_entry={}\n",
             self.show_hidden,
             self.width,
             self.height,
@@ -128,6 +132,7 @@ impl Config {
             self.show_ext_column,
             self.show_permissions_column,
             self.show_owner_column,
+            self.show_parent_entry,
         ));
         output
     }
@@ -150,6 +155,7 @@ mod tests {
             show_ext_column: true,
             show_permissions_column: false,
             show_owner_column: true,
+            show_parent_entry: true,
             hotpaths: Default::default(),
         };
         config.hotpaths[1] = Some(PathBuf::from("/srv/data"));

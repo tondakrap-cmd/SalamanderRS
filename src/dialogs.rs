@@ -5,7 +5,7 @@ use gtk::prelude::*;
 
 use crate::model::OpError;
 
-fn dialog_window(
+pub(crate) fn dialog_window(
     parent: &gtk::ApplicationWindow,
     title: &str,
     width: i32,

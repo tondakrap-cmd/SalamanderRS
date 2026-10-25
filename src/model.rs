@@ -17,6 +17,8 @@ pub enum EntryKind {
     File,
     Symlink,
     Other,
+    /// The optional `..` row leading to the parent directory; not a real entry.
+    Parent,
 }
 
 #[derive(Debug)]
@@ -47,12 +49,44 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
+    /// The `..` row; `path` is the parent location.
+    pub fn parent_link(path: PathBuf) -> FileEntry {
+        FileEntry {
+            path,
+            name: OsString::from(".."),
+            folded_name: "..".to_owned(),
+            kind: EntryKind::Parent,
+            size: 0,
+            modified: None,
+            accessed: None,
+            changed: None,
+            created: None,
+            mode: 0,
+            uid: 0,
+            gid: 0,
+            owner: String::new(),
+            group: String::new(),
+            nlink: 0,
+            inode: 0,
+            link_target: None,
+            target_is_dir: false,
+            has_acl: false,
+        }
+    }
+
+    pub fn is_parent(&self) -> bool {
+        self.kind == EntryKind::Parent
+    }
+
     pub fn is_dir_like(&self) -> bool {
         self.kind == EntryKind::Directory || (self.kind == EntryKind::Symlink && self.target_is_dir)
     }
 
     /// Permission string with the `+` ACL marker, e.g. "drwxr-x---+".
     pub fn mode_text(&self) -> String {
+        if self.is_parent() {
+            return String::new();
+        }
         let mut text = format_mode(self.mode);
         if self.has_acl {
             text.push('+');
@@ -61,7 +95,7 @@ impl FileEntry {
     }
 
     pub fn is_hidden(&self) -> bool {
-        self.folded_name.starts_with('.')
+        !self.is_parent() && self.folded_name.starts_with('.')
     }
 
     /// Lower-cased extension without the dot; directories and dot-files without a further
@@ -289,6 +323,7 @@ pub fn format_size(entry: &FileEntry) -> String {
         EntryKind::Symlink => "<LINK>".to_owned(),
         EntryKind::Other => "<SPECIAL>".to_owned(),
         EntryKind::File => format_bytes(entry.size),
+        EntryKind::Parent => "<UP-DIR>".to_owned(),
     }
 }
 

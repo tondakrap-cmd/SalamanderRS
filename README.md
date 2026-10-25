@@ -17,6 +17,8 @@ Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
 - automatická obnova při změnách na disku (inotify přes GIO)
 - rychlé hledání: stačí začít psát jméno (podporuje `*` a `?`)
 - historie (Alt+←/→); Backspace vrátí kurzor na adresář, ze kterého jste přišli
+- volitelná položka `..` na prvním řádku panelu pro přechod do nadřazené složky
+  (Nástroje → Nastavení…, Ctrl+,)
 - klávesové cesty Ctrl+Shift+0–9 (uložit) a Ctrl+0–9 (skok); fungují i s českým rozložením
 - Alt+F1 / Alt+F2: místa, připojené i nepřipojené svazky (připojí se po Enter),
   záložky GTK, klávesové cesty a historie
@@ -113,7 +115,8 @@ cargo deb
 sudo apt install ./target/debian/salamander-rs_*_amd64.deb
 ```
 
-Nastavení (poslední adresáře, velikost okna, sloupce, klávesové cesty) se ukládá
+Nastavení (okno Nástroje → Nastavení…, poslední adresáře, velikost okna, sloupce,
+klávesové cesty) se ukládá
 do `~/.config/salamander-rs/config`.
 
 ### Testy vzdálených funkcí

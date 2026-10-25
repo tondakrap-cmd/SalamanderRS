@@ -141,7 +141,7 @@ fn add_info_row(grid: &gtk::Grid, row: &mut i32, label: &str, value: &str) -> gt
 
 fn describe_type(entry: &FileEntry) -> String {
     let content_type = match entry.kind {
-        EntryKind::Directory => "inode/directory".to_owned(),
+        EntryKind::Directory | EntryKind::Parent => "inode/directory".to_owned(),
         EntryKind::Symlink => "inode/symlink".to_owned(),
         EntryKind::Other => match entry.mode & model::S_IFMT {
             0o010000 => return "Pojmenovaná roura (FIFO)".to_owned(),

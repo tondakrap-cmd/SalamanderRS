@@ -68,6 +68,15 @@ impl Location {
         }
     }
 
+    /// Display path of the parent location; `None` at the root (local or remote). The parent
+    /// of an archive root is the directory containing the archive.
+    pub fn parent(&self) -> Option<PathBuf> {
+        match self {
+            Location::Remote { path, .. } if path == Path::new("/") => None,
+            other => other.display().parent().map(Path::to_path_buf),
+        }
+    }
+
     /// The real directory: the archive's parent when inside an archive.
     pub fn fs_dir(&self) -> PathBuf {
         match self {
@@ -105,6 +114,8 @@ struct PanelState {
     loading: Option<Location>,
     note: Option<String>,
     show_hidden: bool,
+    /// Shows the `..` row leading to the parent directory.
+    show_parent_entry: bool,
     generation: Cell<u64>,
     pending_cursor: Option<(PathBuf, PathBuf)>,
     history: Vec<PathBuf>,
@@ -193,7 +204,7 @@ struct Totals {
 }
 
 impl Panel {
-    pub fn new(start_dir: &Path, show_hidden: bool) -> Panel {
+    pub fn new(start_dir: &Path, show_hidden: bool, show_parent_entry: bool) -> Panel {
         let root = gtk::Box::new(gtk::Orientation::Vertical, 4);
         root.set_margin_top(6);
         root.set_margin_bottom(4);
@@ -209,12 +220,17 @@ impl Panel {
         let sorted = gtk::SortListModel::new(Some(store.clone()), None::<gtk::Sorter>);
         let section_sorter = gtk::CustomSorter::new(|left, right| {
             let rank = |object: &glib::Object| {
+                // `..` first in either sort direction, then directories, then files.
                 let entry = object.downcast_ref::<EntryObject>().expect("entry object");
-                if entry.with_entry(FileEntry::is_dir_like) {
-                    0
-                } else {
-                    1
-                }
+                entry.with_entry(|item| {
+                    if item.is_parent() {
+                        0
+                    } else if item.is_dir_like() {
+                        1
+                    } else {
+                        2
+                    }
+                })
             };
             rank(left).cmp(&rank(right)).into()
         });
@@ -346,6 +362,7 @@ impl Panel {
                 loading: None,
                 note: None,
                 show_hidden,
+                show_parent_entry,
                 generation: Cell::new(0),
                 pending_cursor: None,
                 history: Vec::new(),
@@ -473,6 +490,12 @@ impl Panel {
         self.reload();
     }
 
+    pub fn set_show_parent_entry(&self, show: bool) {
+        if std::mem::replace(&mut self.state.borrow_mut().show_parent_entry, show) != show {
+            self.reload();
+        }
+    }
+
     pub fn set_column_visible(&self, column: OptionalColumn, visible: bool) {
         let column = match column {
             OptionalColumn::Extension => &self.columns.extension,
@@ -510,17 +533,13 @@ impl Panel {
     pub fn navigate_parent(&self) {
         // Inside an archive the parent of the archive root is the directory containing the
         // archive file, with the cursor on it — the same as for ordinary directories.
-        if let Some((_, path)) = self.remote() {
-            if path == Path::new("/") {
-                return;
-            }
-        }
-        let current = {
+        let (current, parent) = {
             let state = self.state.borrow();
-            state.loading.as_ref().unwrap_or(&state.location).display()
+            let location = state.loading.as_ref().unwrap_or(&state.location);
+            (location.display(), location.parent())
         };
-        if let Some(parent) = current.parent() {
-            self.navigate_and_focus(parent, Some(&current));
+        if let Some(parent) = parent {
+            self.navigate_and_focus(&parent, Some(&current));
         }
     }
 
@@ -562,7 +581,17 @@ impl Panel {
             .map(|entry| entry.with_entry(|entry| entry.path.clone()))
     }
 
+    /// The entry under the cursor; never the `..` row, so operations cannot act on it.
     pub fn cursor_entry(&self) -> Option<EntryObject> {
+        self.cursor_row().filter(|entry| !entry.with_entry(FileEntry::is_parent))
+    }
+
+    /// The cursor stands on the `..` row.
+    pub fn cursor_is_parent(&self) -> bool {
+        self.cursor_row().is_some_and(|entry| entry.with_entry(FileEntry::is_parent))
+    }
+
+    fn cursor_row(&self) -> Option<EntryObject> {
         self.selection
             .selected_item()
             .and_then(|item| item.downcast::<EntryObject>().ok())
@@ -712,6 +741,9 @@ impl Panel {
 
     fn set_marks(&self, decide: impl Fn(&EntryObject) -> bool) {
         for entry in self.store.iter::<EntryObject>().flatten() {
+            if entry.with_entry(FileEntry::is_parent) {
+                continue;
+            }
             let marked = decide(&entry);
             if marked != entry.is_marked() {
                 entry.set_marked(marked);
@@ -743,11 +775,13 @@ impl Panel {
 
     /// Toggles the mark under the cursor and moves the cursor by `delta` rows.
     pub fn mark_and_move(&self, delta: i32) {
-        let Some(entry) = self.cursor_entry() else {
+        // On the `..` row only the cursor moves.
+        if let Some(entry) = self.cursor_entry() {
+            entry.set_marked(!entry.is_marked());
+            self.update_status();
+        } else if !self.cursor_is_parent() {
             return;
-        };
-        entry.set_marked(!entry.is_marked());
-        self.update_status();
+        }
         let position = self.selection.selected();
         if position == gtk::INVALID_LIST_POSITION {
             return;
@@ -896,7 +930,9 @@ impl Panel {
                 .and_downcast::<EntryObject>()
                 .is_some_and(|entry| {
                     entry.with_entry(|item| {
-                        if wildcard {
+                        if item.is_parent() {
+                            false
+                        } else if wildcard {
                             wildcard_match(&pattern, &item.folded_name)
                         } else {
                             item.folded_name.starts_with(&pattern[..pattern.len() - 1])
@@ -1036,10 +1072,16 @@ impl Panel {
             }
         }
 
-        let items: Vec<EntryObject> = listing
-            .entries
+        let parent_row = self
+            .state
+            .borrow()
+            .show_parent_entry
+            .then(|| location.parent())
+            .flatten()
+            .map(|parent| EntryObject::new(FileEntry::parent_link(parent)));
+        let items: Vec<EntryObject> = parent_row
             .into_iter()
-            .map(|entry| {
+            .chain(listing.entries.into_iter().map(|entry| {
                 let marked = marked_paths.contains(&entry.path);
                 let size = dir_sizes.get(&entry.path).copied();
                 let object = EntryObject::new(entry);
@@ -1048,7 +1090,7 @@ impl Panel {
                     object.set_dir_size(size as i64);
                 }
                 object
-            })
+            }))
             .collect();
         self.store.splice(0, self.store.n_items(), &items);
 
@@ -1191,6 +1233,10 @@ impl Panel {
                 .set_markup(&format!("Rychlé hledání: <b>{}</b>", glib::markup_escape_text(&query)));
             return;
         }
+        if self.cursor_is_parent() {
+            self.info_label.set_text("..   (nadřazená složka)");
+            return;
+        }
         let text = self
             .cursor_entry()
             .map(|entry| {
@@ -1217,6 +1263,9 @@ impl Panel {
     fn update_status(&self) {
         let mut totals = Totals::default();
         for entry in self.store.iter::<EntryObject>().flatten() {
+            if entry.with_entry(FileEntry::is_parent) {
+                continue;
+            }
             let is_dir = entry.with_entry(FileEntry::is_dir_like);
             let size = entry.effective_size();
             if is_dir {
@@ -1373,7 +1422,11 @@ fn make_factory(kind: CellKind, store: &gio::ListStore) -> gtk::SignalListItemFa
             let (Some(item), Some(store)) = (weak_item.upgrade(), weak_store.upgrade()) else {
                 return;
             };
-            if let Some(entry) = item.item().and_downcast::<EntryObject>() {
+            if let Some(entry) = item
+                .item()
+                .and_downcast::<EntryObject>()
+                .filter(|entry| !entry.with_entry(FileEntry::is_parent))
+            {
                 entry.set_marked(!entry.is_marked());
                 // Lets the panel refresh its status line (rows are kept for the same item).
                 if let Some(position) = store.find(&entry) {
@@ -1425,6 +1478,9 @@ fn make_factory(kind: CellKind, store: &gio::ListStore) -> gtk::SignalListItemFa
 }
 
 fn icon_for(entry: &FileEntry) -> gio::Icon {
+    if entry.is_parent() {
+        return gio::ThemedIcon::new("go-up").upcast();
+    }
     let content_type = if entry.is_dir_like() {
         glib::GString::from("inode/directory")
     } else if entry.kind == EntryKind::Symlink {
@@ -1472,9 +1528,31 @@ fn update_cell(kind: CellKind, child: &gtk::Widget, entry: &EntryObject) {
         }),
         CellKind::Extension => entry.with_entry(|item| item.extension().to_owned()),
         CellKind::Size => entry.display_size(),
+        _ if entry.with_entry(FileEntry::is_parent) => String::new(),
         CellKind::Modified => entry.with_entry(|item| format_modified(item.modified)),
         CellKind::Permissions => entry.with_entry(FileEntry::mode_text),
         CellKind::Owner => entry.with_entry(|item| format!("{}:{}", item.owner, item.group)),
     };
     label.set_text(&text);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parent_locations() {
+        assert_eq!(Location::Dir(PathBuf::from("/")).parent(), None);
+        assert_eq!(Location::Dir(PathBuf::from("/home/me")).parent(), Some(PathBuf::from("/home")));
+        let archive = |inner: &str| Location::Archive {
+            archive: PathBuf::from("/data/a.zip"),
+            inner: PathBuf::from(inner),
+        };
+        assert_eq!(archive("").parent(), Some(PathBuf::from("/data")));
+        assert_eq!(archive("dir/sub").parent(), Some(PathBuf::from("/data/a.zip/dir")));
+        let remote = |path: &str| Location::Remote { id: "abc".to_owned(), path: PathBuf::from(path) };
+        assert_eq!(remote("/").parent(), None);
+        assert_eq!(remote("/srv").parent(), Some(PathBuf::from("sftp://abc/")));
+        assert_eq!(remote("/srv/www").parent(), Some(PathBuf::from("sftp://abc/srv")));
+    }
 }

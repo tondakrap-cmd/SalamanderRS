@@ -12,6 +12,7 @@ mod places;
 mod props;
 mod remote;
 mod remote_ui;
+mod settings;
 mod sodium;
 mod sys;
 mod vault;

@@ -687,7 +687,7 @@ pub fn extract(
                     .map_err(|error| error.to_string())?;
                 sys::set_times(&target, None, info.modified).map_err(|error| error.to_string())
             }),
-            EntryKind::Other => Err("nepodporovaný typ položky".to_owned()),
+            EntryKind::Other | EntryKind::Parent => Err("nepodporovaný typ položky".to_owned()),
         };
         match outcome {
             Ok(()) => result.done += 1,

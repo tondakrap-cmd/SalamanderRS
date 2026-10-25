@@ -25,6 +25,7 @@ use crate::ops::{self, ConflictAction, Op, OpEvent, OpKind};
 use crate::panel::{OptionalColumn, Panel, SortKey};
 use crate::places;
 use crate::props;
+use crate::settings;
 use crate::viewer;
 
 #[path = "window_remote.rs"]
@@ -122,8 +123,12 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
     let left_dir = open_dir
         .filter(|path| path.is_dir())
         .or_else(|| config.left_dir.clone());
-    let left = Panel::new(&start_dir(left_dir.as_deref()), config.show_hidden);
-    let right = Panel::new(&start_dir(config.right_dir.as_deref()), config.show_hidden);
+    let left = Panel::new(&start_dir(left_dir.as_deref()), config.show_hidden, config.show_parent_entry);
+    let right = Panel::new(
+        &start_dir(config.right_dir.as_deref()),
+        config.show_hidden,
+        config.show_parent_entry,
+    );
     for panel in [&left, &right] {
         panel.set_column_visible(OptionalColumn::Extension, config.show_ext_column);
         panel.set_column_visible(OptionalColumn::Permissions, config.show_permissions_column);
@@ -358,10 +363,15 @@ fn build_menu_bar(_config: &Config) -> gtk::PopoverMenuBar {
         ]),
     );
 
-    let tools_menu = section(&[
-        ("Hledat soubory…", "win.find", None),
-        ("Otevřít terminál zde", "win.terminal", None),
-    ]);
+    let tools_menu = gio::Menu::new();
+    tools_menu.append_section(
+        None,
+        &section(&[
+            ("Hledat soubory…", "win.find", None),
+            ("Otevřít terminál zde", "win.terminal", None),
+        ]),
+    );
+    tools_menu.append_section(None, &section(&[("Nastavení…", "win.settings", None)]));
 
     let help_menu = section(&[
         ("Klávesové zkratky", "win.shortcuts", None),
@@ -648,12 +658,38 @@ fn add_column_toggle(
         if let Some(state) = weak_state.upgrade() {
             state.left.set_column_visible(column, visible);
             state.right.set_column_visible(column, visible);
-            let mut config = state.config.borrow_mut();
-            match column {
-                OptionalColumn::Extension => config.show_ext_column = visible,
-                OptionalColumn::Permissions => config.show_permissions_column = visible,
-                OptionalColumn::Owner => config.show_owner_column = visible,
+            {
+                let mut config = state.config.borrow_mut();
+                match column {
+                    OptionalColumn::Extension => config.show_ext_column = visible,
+                    OptionalColumn::Permissions => config.show_permissions_column = visible,
+                    OptionalColumn::Owner => config.show_owner_column = visible,
+                }
             }
+            save_settings(&state);
+        }
+    });
+    window.add_action(&action);
+}
+
+/// Settings changed in the menu or the settings window are saved right away.
+fn save_settings(state: &WindowState) {
+    if let Err(error) = state.config.borrow().save() {
+        eprintln!("salamander-rs: nelze uložit nastavení: {error}");
+    }
+}
+
+fn add_parent_entry_toggle(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, initial: bool) {
+    let action = gio::SimpleAction::new_stateful("parent-entry", None, &initial.to_variant());
+    let weak_state = Rc::downgrade(state);
+    action.connect_activate(move |action, _| {
+        let show = !action.state().and_then(|state| state.get::<bool>()).unwrap_or(false);
+        action.set_state(&show.to_variant());
+        if let Some(state) = weak_state.upgrade() {
+            state.left.set_show_parent_entry(show);
+            state.right.set_show_parent_entry(show);
+            state.config.borrow_mut().show_parent_entry = show;
+            save_settings(&state);
         }
     });
     window.add_action(&action);
@@ -791,7 +827,9 @@ fn install_actions(
             config.show_permissions_column,
         );
         add_column_toggle(window, state, "column-owner", OptionalColumn::Owner, config.show_owner_column);
+        add_parent_entry_toggle(window, state, config.show_parent_entry);
     }
+    action("settings", &["<Control>comma"], |window, _| settings::open(window));
 
     // File operations.
     routed("rename", &["F2"], begin_rename, remote_rename);
@@ -969,7 +1007,7 @@ Archivy (zip, tar.gz/xz/zst/bz2, 7z, rar, iso, deb, …)
 
 Zobrazení a nástroje
   Ctrl+H skryté soubory, Ctrl+R obnovit, Ctrl+F3…F6 řadit jméno/přípona/čas/velikost
-  Alt+F7 hledat soubory, Ctrl+T terminál, Ctrl+Q / Alt+F4 konec
+  Alt+F7 hledat soubory, Ctrl+T terminál, Ctrl+, nastavení, Ctrl+Q / Alt+F4 konec
 
 Vzdálené servery (SSH/SFTP)
   Ctrl+K — správce serverů a připojení; servery jsou i v Alt+F1/Alt+F2
@@ -2410,6 +2448,10 @@ fn run_copy_move(
 }
 
 fn activate_entry(panel: &Panel, window: &gtk::ApplicationWindow) {
+    if panel.cursor_is_parent() {
+        panel.navigate_parent();
+        return;
+    }
     if panel.remote().is_some() {
         remote_activate(window, panel);
         return;

@@ -450,7 +450,9 @@ impl Panel {
 
     pub fn resolve_path(&self, requested: &Path) -> PathBuf {
         let expanded = expand_tilde(requested);
-        if expanded.is_absolute() {
+        // A full `sftp://` path is relative for std, but must not be joined to the location.
+        let is_remote = expanded.as_os_str().as_encoded_bytes().starts_with(crate::remote::SCHEME.as_bytes());
+        if expanded.is_absolute() || is_remote {
             expanded
         } else {
             self.state.borrow().location.display().join(expanded)

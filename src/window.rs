@@ -2108,10 +2108,14 @@ fn begin_copy_move(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, kin
             let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
                 return;
             };
+            let dest_dir = source_panel.resolve_path(Path::new(&destination));
+            if !dest_dir.is_absolute() {
+                show_error(&window, "Na server kopírujte do panelu připojeného k serveru (Ctrl+K)");
+                return;
+            }
             if !try_begin_busy(&state) {
                 return;
             }
-            let dest_dir = source_panel.resolve_path(Path::new(&destination));
             run_copy_move(
                 &window,
                 &state,
@@ -2496,37 +2500,51 @@ fn open_terminal(window: &gtk::ApplicationWindow, dir: &Path) {
     );
 }
 
+/// Opens a file in its default application (mimeapps.list via GIO). xdg-open is not used:
+/// on some desktops (e.g. LXQt without qtxdg-tools) it fails with exit status 3.
 fn open_file(window: &gtk::ApplicationWindow, path: PathBuf) {
-    let mut child = match Command::new("xdg-open").arg(&path).spawn() {
-        Ok(child) => child,
-        Err(error) => {
-            show_error(window, &format!("Nelze spustit xdg-open: {error}"));
-            return;
-        }
-    };
+    let file = gio::File::for_path(&path);
+    let content_type = file
+        .query_info(
+            gio::FILE_ATTRIBUTE_STANDARD_CONTENT_TYPE,
+            gio::FileQueryInfoFlags::NONE,
+            gio::Cancellable::NONE,
+        )
+        .ok()
+        .and_then(|info| info.content_type())
+        .unwrap_or_else(|| gio::content_type_guess(Some(&path), None).0);
+    match gio::AppInfo::default_for_type(&content_type, false) {
+        Some(app) => launch_app(window, &app, &file),
+        None => choose_app(window, &file, &content_type),
+    }
+}
 
-    let (sender, receiver) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        let result = child.wait();
-        let _ = sender.send_blocking(result);
-    });
+fn launch_app(window: &gtk::ApplicationWindow, app: &gio::AppInfo, file: &gio::File) {
+    let context = WidgetExt::display(window).app_launch_context();
+    if let Err(error) = app.launch(&[file.clone()], Some(&context)) {
+        show_error(window, &format!("Nelze spustit {}: {error}", app.name()));
+    }
+}
 
+/// No default application for the type: lets the user pick one (remembered as last used).
+#[allow(deprecated)]
+fn choose_app(window: &gtk::ApplicationWindow, file: &gio::File, content_type: &str) {
+    let dialog = gtk::AppChooserDialog::new(Some(window), gtk::DialogFlags::MODAL, file);
+    dialog.set_title(Some("Otevřít pomocí"));
+    dialog.widget().downcast::<gtk::AppChooserWidget>().map(|widget| widget.set_show_all(true)).ok();
     let weak_window = window.downgrade();
-    glib::spawn_future_local(async move {
-        let Ok(result) = receiver.recv().await else {
+    let file = file.clone();
+    let content_type = content_type.to_owned();
+    dialog.connect_response(move |dialog, response| {
+        let app = (response == gtk::ResponseType::Ok).then(|| dialog.app_info()).flatten();
+        dialog.destroy();
+        let (Some(app), Some(window)) = (app, weak_window.upgrade()) else {
             return;
         };
-        let Some(window) = weak_window.upgrade() else {
-            return;
-        };
-        match result {
-            Ok(status) if !status.success() => {
-                show_error(&window, &format!("xdg-open selhal: {status}"));
-            }
-            Err(error) => show_error(&window, &format!("xdg-open selhal: {error}")),
-            Ok(_) => {}
-        }
+        let _ = app.set_as_last_used_for_type(&content_type);
+        launch_app(&window, &app, &file);
     });
+    dialog.present();
 }
 
 fn show_error(window: &gtk::ApplicationWindow, message: &str) {

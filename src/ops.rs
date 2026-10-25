@@ -599,6 +599,8 @@ where
             } else if let Err(error) = preserve_times(metadata, target) {
                 self.fail(top, source, Some(target), error);
                 ok = false;
+            } else {
+                let _ = crate::xattr::copy_all(source, target);
             }
         }
         ok
@@ -711,6 +713,8 @@ where
                 } else if let Err(error) = preserve_times(metadata, &staging) {
                     self.fail(top, source, Some(target), error);
                     ok = false;
+                } else {
+                    let _ = crate::xattr::copy_all(source, &staging);
                 }
             }
         }
@@ -789,6 +793,9 @@ where
                                 fs::set_permissions(&staging, metadata.permissions())
                                     .map_err(|error| error.to_string())
                                     .and_then(|()| preserve_times(metadata, &staging))
+                                    .map(|()| {
+                                        let _ = crate::xattr::copy_all(source, &staging);
+                                    })
                             {
                                 self.fail(top, source, Some(target), error);
                                 if let Err(cleanup) = remove_if_exists(&staging) {
@@ -915,6 +922,9 @@ where
             self.fail(top, source, Some(target), error);
             return false;
         }
+        // Extended attributes and ACLs are copied best effort, like `cp -a` on filesystems
+        // that may not support them.
+        let _ = crate::xattr::copy_all(source, target);
         self.done_files = self.done_files.saturating_add(1);
         self.progress(source)
     }

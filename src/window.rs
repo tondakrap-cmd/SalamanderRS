@@ -13,6 +13,8 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::archive;
+use crate::archive_ui;
 use crate::attrs::{self, AttrChange};
 use crate::clipboard;
 use crate::config::{Config, HOTPATH_COUNT};
@@ -104,7 +106,13 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
         window.maximize();
     }
 
-    let left_dir = open_dir.or_else(|| config.left_dir.clone());
+    // An archive given on the command line is opened inside the left panel.
+    let open_archive = open_dir
+        .clone()
+        .filter(|path| path.is_file() && archive::looks_like_archive(path));
+    let left_dir = open_dir
+        .filter(|path| path.is_dir())
+        .or_else(|| config.left_dir.clone());
     let left = Panel::new(&start_dir(left_dir.as_deref()), config.show_hidden);
     let right = Panel::new(&start_dir(config.right_dir.as_deref()), config.show_hidden);
     for panel in [&left, &right] {
@@ -152,6 +160,9 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
     connect_panel(&window, &state, WhichPanel::Left);
     connect_panel(&window, &state, WhichPanel::Right);
     install_actions(app, &window, &state);
+    if let Some(path) = open_archive {
+        state.left.navigate(&path);
+    }
 
     // The window owns the shared state for its whole lifetime. Other callbacks
     // use weak references so the panel widgets do not form reference cycles.
@@ -163,6 +174,17 @@ pub fn build(app: &gtk::Application, open_dir: Option<PathBuf>) {
         }
         save_config(window, &owned_state);
         glib::Propagation::Proceed
+    });
+
+    // After a dialog closes or the window is re-activated without a focused widget, keys
+    // must go to the active panel rather than nowhere.
+    let weak_state = Rc::downgrade(&state);
+    window.connect_is_active_notify(move |window| {
+        if window.is_active() && gtk::prelude::RootExt::focus(window).is_none() {
+            if let Some(state) = weak_state.upgrade() {
+                state.active_panel().view().grab_focus();
+            }
+        }
     });
 
     window.present();
@@ -233,6 +255,14 @@ fn build_menu_bar(_config: &Config) -> gtk::PopoverMenuBar {
             ("Vlastnosti…", "win.properties", None),
             ("Oprávnění a atributy…", "win.attributes", None),
             ("Spočítat obsazené místo", "win.calc-size", None),
+        ]),
+    );
+    file_menu.append_section(
+        None,
+        &section(&[
+            ("Zabalit…", "win.pack", None),
+            ("Rozbalit…", "win.unpack", None),
+            ("Otevřít v aplikaci", "win.open-external", Some("<Shift>Return")),
         ]),
     );
     file_menu.append_section(None, &section(&[("Zavřít", "win.close", None)]));
@@ -497,6 +527,7 @@ fn connect_panel(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, which
             Key::Tab | Key::ISO_Left_Tab => Some("switch-panel"),
             Key::Return | Key::KP_Enter if alt && shift => Some("calc-size"),
             Key::Return | Key::KP_Enter if alt => Some("properties"),
+            Key::Return | Key::KP_Enter if shift => Some("open-external"),
             Key::Return | Key::KP_Enter => Some("activate-entry"),
             Key::BackSpace if plain => Some("go-parent"),
             Key::Insert if plain => Some("toggle-mark"),
@@ -604,6 +635,16 @@ fn install_actions(
     let action = |name: &str, accels: &[&str], handler: fn(&gtk::ApplicationWindow, &Rc<WindowState>)| {
         add_window_action(app, window, state, name, accels, handler);
     };
+    // Actions that only make sense on real files are refused inside archives.
+    let fs_action = |name: &str, accels: &[&str], handler: fn(&gtk::ApplicationWindow, &Rc<WindowState>)| {
+        add_window_action(app, window, state, name, accels, move |window, state| {
+            if state.active_panel().archive().is_some() {
+                show_error(window, ARCHIVE_UNSUPPORTED);
+            } else {
+                handler(window, state);
+            }
+        });
+    };
 
     // Panel and navigation.
     action("switch-panel", &[], |_, state| {
@@ -626,12 +667,12 @@ fn install_actions(
         entry.select_region(0, -1);
     });
     action("swap-panels", &["<Control>u"], |_, state| {
-        let (left, right) = (state.left.dir(), state.right.dir());
+        let (left, right) = (state.left.location().display(), state.right.location().display());
         state.left.navigate(&right);
         state.right.navigate(&left);
     });
     action("same-dir", &[], |_, state| {
-        let dir = state.active_panel().dir();
+        let dir = state.active_panel().location().display();
         state.other_panel().navigate(&dir);
     });
     action("places-left", &["<Alt>F1"], |window, state| {
@@ -704,13 +745,28 @@ fn install_actions(
     }
 
     // File operations.
-    action("rename", &["F2"], begin_rename);
+    fs_action("rename", &["F2"], begin_rename);
     action("view", &["F3"], |window, state| {
-        if let Some(path) = state.active_panel().cursor_path() {
+        let panel = state.active_panel();
+        if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
+            if !is_dir {
+                with_extracted(window, archive, inner, |window, path| viewer::open(window, &path));
+            }
+        } else if let Some(path) = panel.cursor_path() {
             viewer::open(window, &path);
         }
     });
-    action("edit", &["F4"], |window, state| {
+    action("open-external", &[], |window, state| {
+        let panel = state.active_panel();
+        if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
+            if !is_dir {
+                with_extracted(window, archive, inner, |window, path| open_file(window, path));
+            }
+        } else if let Some(path) = panel.cursor_path() {
+            open_file(window, path);
+        }
+    });
+    fs_action("edit", &["F4"], |window, state| {
         if let Some(path) = state.active_panel().cursor_path() {
             if path.is_dir() {
                 show_error(window, "Adresář nelze upravit; použijte Enter");
@@ -719,25 +775,31 @@ fn install_actions(
             }
         }
     });
-    action("new-file", &["<Shift>F4"], begin_new_file);
+    fs_action("new-file", &["<Shift>F4"], begin_new_file);
     action("copy", &["F5"], |window, state| begin_copy_move(window, state, OpKind::Copy));
     action("move", &["F6"], |window, state| begin_copy_move(window, state, OpKind::Move));
-    action("mkdir", &["F7"], begin_mkdir);
-    action("symlink", &["<Control><Shift>F5"], begin_symlink);
+    fs_action("mkdir", &["F7"], begin_mkdir);
+    fs_action("symlink", &["<Control><Shift>F5"], begin_symlink);
+    fs_action("pack", &["<Alt>F5"], begin_pack);
+    action("unpack", &["<Alt>F9"], begin_unpack);
     action("trash", &["F8"], |window, state| begin_removal(window, state, false));
     action("delete", &["<Shift>F8"], |window, state| begin_removal(window, state, true));
     action("properties", &["<Alt>Return"], |window, state| {
-        open_properties(window, state, props::Page::General)
+        if state.active_panel().archive().is_some() {
+            show_archive_info(window, state.active_panel());
+        } else {
+            open_properties(window, state, props::Page::General)
+        }
     });
-    action("attributes", &["<Control>F2"], |window, state| {
+    fs_action("attributes", &["<Control>F2"], |window, state| {
         open_properties(window, state, props::Page::Permissions)
     });
-    action("calc-size", &["<Alt><Shift>Return"], calculate_size);
+    fs_action("calc-size", &["<Alt><Shift>Return"], calculate_size);
 
     // Clipboard.
-    action("clip-copy", &[], |window, state| clipboard_copy(window, state, false));
-    action("clip-cut", &[], |window, state| clipboard_copy(window, state, true));
-    action("clip-paste", &[], clipboard_paste);
+    fs_action("clip-copy", &[], |window, state| clipboard_copy(window, state, false));
+    fs_action("clip-cut", &[], |window, state| clipboard_copy(window, state, true));
+    fs_action("clip-paste", &[], clipboard_paste);
     action("copy-path", &[], |window, state| {
         let paths = state.active_panel().selected_or_cursor();
         if paths.is_empty() {
@@ -822,6 +884,12 @@ Soubory
   F8, Delete — do koše; Shift+F8, Shift+Delete — trvale smazat
   Alt+Enter — vlastnosti; Ctrl+F2 — oprávnění, vlastník, časy
   Alt+Shift+Enter — spočítat obsazené místo
+  Shift+Enter — otevřít v přidružené aplikaci
+
+Archivy (zip, tar.gz/xz/zst/bz2, 7z, rar, iso, deb, …)
+  Enter na archivu — procházet jako adresář, Backspace — zpět ven
+  F5 z archivu — rozbalit vybrané; F5 do archivu — přidat; F8 v archivu — odstranit
+  Alt+F5 — zabalit výběr, Alt+F9 — rozbalit vybrané archivy
   Ctrl+C / Ctrl+X / Ctrl+V — schránka (kompatibilní s jinými správci)
   Ctrl+Shift+C — zkopírovat cestu jako text
 
@@ -831,6 +899,432 @@ Zobrazení a nástroje
 
 Prohlížeč (F3)
   Ctrl+F / F7 hledat, F3 / Shift+F3 další / předchozí, H text/hex, W zalamování, Esc zavřít";
+
+const ARCHIVE_UNSUPPORTED: &str =
+    "V archivu tato operace není podporována. Archiv lze procházet, rozbalovat (F5), \
+     doplňovat (F5 z druhého panelu) a mazat z něj (F8).";
+
+/// `(archive, inner path, is directory)` of the cursor entry inside an archive panel.
+fn archive_cursor(panel: &Panel) -> Option<(PathBuf, PathBuf, bool)> {
+    let (archive, _) = panel.archive()?;
+    let entry = panel.cursor_entry()?;
+    let (path, is_dir) = entry.with_entry(|item| (item.path.clone(), item.is_dir_like()));
+    let inner = path.strip_prefix(&archive).ok()?.to_path_buf();
+    Some((archive, inner, is_dir))
+}
+
+/// Extracts one archive member to a private temporary directory in the background.
+fn with_extracted(
+    window: &gtk::ApplicationWindow,
+    archive: PathBuf,
+    inner: PathBuf,
+    then: impl FnOnce(&gtk::ApplicationWindow, PathBuf) + 'static,
+) {
+    let (sender, receiver) = async_channel::bounded(1);
+    std::thread::spawn(move || {
+        let _ = sender.send_blocking(archive::extract_to_temp(&archive, &inner));
+    });
+    let weak_window = window.downgrade();
+    glib::spawn_future_local(async move {
+        let (Ok(result), Some(window)) = (receiver.recv().await, weak_window.upgrade()) else {
+            return;
+        };
+        match result {
+            Ok(path) => then(&window, path),
+            Err(error) => show_error(&window, &format!("Nelze rozbalit: {error}")),
+        }
+    });
+}
+
+type JobFn = dyn FnOnce(&AtomicBool, &mut dyn FnMut(&Path)) -> archive::JobResult + Send;
+
+/// Runs a long archive job in a worker thread with a cancellable progress window, then
+/// refreshes both panels and reports errors.
+fn run_job(
+    window: &gtk::ApplicationWindow,
+    state: &Rc<WindowState>,
+    title: &str,
+    clear_marks: Option<Panel>,
+    job: Box<JobFn>,
+) {
+    if !try_begin_busy(state) {
+        return;
+    }
+    let cancel = Arc::new(AtomicBool::new(false));
+    let progress_cancel = Arc::clone(&cancel);
+    let progress = dialogs::Progress::new(window, title, move || {
+        progress_cancel.store(true, Ordering::Relaxed)
+    });
+    let (sender, receiver) = async_channel::unbounded::<Result<archive::JobResult, PathBuf>>();
+    std::thread::spawn(move || {
+        let mut last = std::time::Instant::now();
+        let progress_sender = sender.clone();
+        let mut report = |path: &Path| {
+            if last.elapsed() >= Duration::from_millis(100) {
+                last = std::time::Instant::now();
+                let _ = progress_sender.send_blocking(Err(path.to_path_buf()));
+            }
+        };
+        let result = job(&cancel, &mut report);
+        let _ = sender.send_blocking(Ok(result));
+    });
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    glib::spawn_future_local(async move {
+        while let Ok(message) = receiver.recv().await {
+            match message {
+                Err(path) => progress.update(&path.to_string_lossy()),
+                Ok(result) => {
+                    progress.finish();
+                    if let Some(state) = weak_state.upgrade() {
+                        state.busy.set(false);
+                        state.left.reload();
+                        state.right.reload();
+                        if let Some(panel) = &clear_marks {
+                            panel.clear_marks();
+                        }
+                        state.flash(&format!(
+                            "Hotovo, položek: {}{}",
+                            result.done,
+                            if result.cancelled { " (přerušeno)" } else { "" }
+                        ));
+                    }
+                    if let Some(window) = weak_window.upgrade() {
+                        dialogs::show_errors(&window, &result.errors);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+fn absolute_in(base: &Path, typed: &str) -> PathBuf {
+    let path = PathBuf::from(typed);
+    if path.is_absolute() {
+        path
+    } else {
+        base.join(path)
+    }
+}
+
+fn begin_extract(
+    window: &gtk::ApplicationWindow,
+    state: &Rc<WindowState>,
+    archive: PathBuf,
+    base: PathBuf,
+) {
+    let source_panel = state.active_panel().clone();
+    let items = source_panel.archive_selection();
+    if items.is_empty() {
+        return;
+    }
+    let dest = state.other_panel().dir();
+    let base_dest = dest.clone();
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    archive_ui::unpack_dialog(
+        window,
+        "Rozbalit z archivu",
+        &format!("Rozbalit {} položek z {} do:", items.len(), archive.to_string_lossy()),
+        &dest,
+        false,
+        move |options| {
+            let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+                return;
+            };
+            let dest = absolute_in(&base_dest, &options.dest.to_string_lossy());
+            run_job(
+                &window,
+                &state,
+                "Rozbaluji",
+                Some(source_panel),
+                Box::new(move |cancel, progress| {
+                    if let Err(error) = fs::create_dir_all(&dest) {
+                        let mut result = archive::JobResult::default();
+                        result.errors.push(crate::model::OpError {
+                            source: dest,
+                            target: None,
+                            error: error.to_string(),
+                        });
+                        return result;
+                    }
+                    archive::extract(
+                        &archive::ExtractRequest {
+                            archive: &archive,
+                            items: &items,
+                            base: &base,
+                            dest: &dest,
+                            overwrite: options.overwrite,
+                        },
+                        cancel,
+                        progress,
+                    )
+                }),
+            );
+        },
+    );
+}
+
+fn begin_add_to_archive(
+    window: &gtk::ApplicationWindow,
+    state: &Rc<WindowState>,
+    archive: PathBuf,
+    inner: PathBuf,
+) {
+    let source_panel = state.active_panel().clone();
+    let sources = source_panel.selected_or_cursor();
+    if sources.is_empty() {
+        return;
+    }
+    let index = match archive::index(&archive) {
+        Ok(index) => index,
+        Err(error) => {
+            show_error(window, &format!("Nelze číst archiv: {error}"));
+            return;
+        }
+    };
+    if !index.is_writable() {
+        show_error(window, &format!("Do archivu formátu {} nelze zapisovat", index.format));
+        return;
+    }
+    let replaced = sources
+        .iter()
+        .filter_map(|source| source.file_name())
+        .filter(|name| index.contains(&inner.join(name)))
+        .count();
+    let mut message = format!(
+        "Přidat {} položek do {}?",
+        sources.len(),
+        crate::panel::Location::Archive {
+            archive: archive.clone(),
+            inner: inner.clone(),
+        }
+        .display()
+        .to_string_lossy()
+    );
+    if replaced > 0 {
+        message.push_str(&format!("\n{replaced} stejnojmenných položek v archivu bude nahrazeno."));
+    }
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    dialogs::confirm(window, "Přidat do archivu", &message, "Přidat", move || {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return;
+        };
+        run_job(
+            &window,
+            &state,
+            "Přidávám do archivu",
+            Some(source_panel),
+            Box::new(move |cancel, progress| {
+                archive::modify(&archive, &[], &sources, &inner, cancel, progress)
+            }),
+        );
+    });
+}
+
+fn begin_archive_delete(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, archive: PathBuf) {
+    let items = state.active_panel().archive_selection();
+    if items.is_empty() {
+        return;
+    }
+    let writable = archive::index(&archive).is_ok_and(|index| index.is_writable());
+    if !writable {
+        show_error(window, "Tento formát archivu je jen pro čtení");
+        return;
+    }
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    dialogs::confirm(
+        window,
+        "Odstranit z archivu",
+        &format!(
+            "Odstranit {} položek z archivu {}? Tuto akci nelze vrátit.",
+            items.len(),
+            archive.to_string_lossy()
+        ),
+        "Odstranit",
+        move || {
+            let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+                return;
+            };
+            run_job(
+                &window,
+                &state,
+                "Odstraňuji z archivu",
+                None,
+                Box::new(move |cancel, progress| {
+                    archive::modify(&archive, &items, &[], Path::new(""), cancel, progress)
+                }),
+            );
+        },
+    );
+}
+
+fn begin_pack(window: &gtk::ApplicationWindow, state: &Rc<WindowState>) {
+    if state.busy.get() {
+        return;
+    }
+    let source_panel = state.active_panel().clone();
+    let sources = source_panel.selected_or_cursor();
+    if sources.is_empty() {
+        return;
+    }
+    let dest_dir = if state.other_panel().archive().is_none() {
+        state.other_panel().dir()
+    } else {
+        source_panel.dir()
+    };
+    let default_name = if sources.len() == 1 {
+        let name = sources[0]
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        archive_ui::strip_archive_extension(&name).to_owned()
+    } else {
+        source_panel
+            .dir()
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "archiv".to_owned())
+    };
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    archive_ui::pack_dialog(window, sources.len(), &dest_dir, &default_name, move |target, format| {
+        let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+            return;
+        };
+        let target = absolute_in(&source_panel.dir(), &target.to_string_lossy());
+        if target.exists() {
+            show_error(&window, &format!("{} již existuje", target.to_string_lossy()));
+            return;
+        }
+        run_job(
+            &window,
+            &state,
+            &format!("Balím do {}", format.label()),
+            Some(source_panel),
+            Box::new(move |cancel, progress| archive::create(&target, format, &sources, cancel, progress)),
+        );
+    });
+}
+
+fn begin_unpack(window: &gtk::ApplicationWindow, state: &Rc<WindowState>) {
+    if state.busy.get() {
+        return;
+    }
+    if state.active_panel().archive().is_some() {
+        // Inside an archive Alt+F9 extracts the selection, like F5.
+        begin_copy_move(window, state, OpKind::Copy);
+        return;
+    }
+    let archives: Vec<PathBuf> = state
+        .active_panel()
+        .selected_or_cursor()
+        .into_iter()
+        .filter(|path| path.is_file() && archive::looks_like_archive(path))
+        .collect();
+    if archives.is_empty() {
+        show_error(window, "Vyberte archivy k rozbalení (zip, tar.gz, 7z, …)");
+        return;
+    }
+    let dest = if state.other_panel().archive().is_none() {
+        state.other_panel().dir()
+    } else {
+        state.active_panel().dir()
+    };
+    let base_dest = dest.clone();
+    let weak_state = Rc::downgrade(state);
+    let weak_window = window.downgrade();
+    archive_ui::unpack_dialog(
+        window,
+        "Rozbalit archivy",
+        &format!("Rozbalit {} archivů do:", archives.len()),
+        &dest,
+        true,
+        move |options| {
+            let (Some(state), Some(window)) = (weak_state.upgrade(), weak_window.upgrade()) else {
+                return;
+            };
+            let dest = absolute_in(&base_dest, &options.dest.to_string_lossy());
+            run_job(
+                &window,
+                &state,
+                "Rozbaluji archivy",
+                None,
+                Box::new(move |cancel, progress| {
+                    let mut total = archive::JobResult::default();
+                    for source in &archives {
+                        let target = if options.subfolder {
+                            let name = source
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            dest.join(archive_ui::strip_archive_extension(&name))
+                        } else {
+                            dest.clone()
+                        };
+                        if let Err(error) = fs::create_dir_all(&target) {
+                            total.errors.push(crate::model::OpError {
+                                source: target,
+                                target: None,
+                                error: error.to_string(),
+                            });
+                            continue;
+                        }
+                        let result = archive::extract(
+                            &archive::ExtractRequest {
+                                archive: source,
+                                items: &[],
+                                base: Path::new(""),
+                                dest: &target,
+                                overwrite: options.overwrite,
+                            },
+                            cancel,
+                            progress,
+                        );
+                        total.done += result.done;
+                        total.errors.extend(result.errors);
+                        if result.cancelled {
+                            total.cancelled = true;
+                            break;
+                        }
+                    }
+                    total
+                }),
+            );
+        },
+    );
+}
+
+fn show_archive_info(window: &gtk::ApplicationWindow, panel: &Panel) {
+    let (Some((archive, inner, _)), Some(entry)) = (archive_cursor(panel), panel.cursor_entry()) else {
+        return;
+    };
+    let format = archive::index(&archive)
+        .map(|index| index.format.clone())
+        .unwrap_or_default();
+    let size = entry.display_size();
+    let text = entry.with_entry(|item| {
+        let mut text = format!(
+            "Název: {}\nCesta v archivu: {}\nArchiv: {}\nFormát: {format}\nVelikost: {size}\n\
+             Změněno: {}\nOprávnění: {}\nVlastník: {}:{}",
+            item.name.to_string_lossy(),
+            inner.to_string_lossy(),
+            archive.to_string_lossy(),
+            crate::model::format_time(item.modified, "%Y-%m-%d %H:%M:%S"),
+            item.mode_text(),
+            item.owner,
+            item.group
+        );
+        if let Some(target) = &item.link_target {
+            text.push_str(&format!("\nCíl odkazu: {}", target.to_string_lossy()));
+        }
+        text
+    });
+    dialogs::info(window, "Vlastnosti položky archivu", &text);
+}
 
 fn try_begin_busy(state: &WindowState) -> bool {
     if state.busy.get() {
@@ -847,7 +1341,7 @@ fn open_in_panel(state: &Rc<WindowState>, target: WhichPanel) {
         .cursor_entry()
         .filter(|entry| entry.with_entry(|item| item.is_dir_like()))
         .map(|entry| entry.with_entry(|item| item.path.clone()))
-        .unwrap_or_else(|| active.dir());
+        .unwrap_or_else(|| active.location().display());
     state.panel(target).navigate(&path);
 }
 
@@ -1367,6 +1861,10 @@ fn begin_removal(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, perma
     if state.busy.get() {
         return;
     }
+    if let Some((archive, _)) = state.active_panel().archive() {
+        begin_archive_delete(window, state, archive);
+        return;
+    }
     let paths = state.active_panel().selected_or_cursor();
     if paths.is_empty() {
         return;
@@ -1435,6 +1933,27 @@ fn begin_removal(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, perma
 fn begin_copy_move(window: &gtk::ApplicationWindow, state: &Rc<WindowState>, kind: OpKind) {
     if state.busy.get() {
         return;
+    }
+    let active_archive = state.active_panel().archive();
+    let other_archive = state.other_panel().archive();
+    if kind == OpKind::Move && (active_archive.is_some() || other_archive.is_some()) {
+        show_error(window, "Přesun z archivu nebo do archivu není podporován; použijte F5 a potom F8");
+        return;
+    }
+    match (active_archive, other_archive) {
+        (Some(_), Some(_)) => {
+            show_error(window, "Kopírování mezi dvěma archivy není podporováno");
+            return;
+        }
+        (Some((archive, inner)), None) => {
+            begin_extract(window, state, archive, inner);
+            return;
+        }
+        (None, Some((archive, inner))) => {
+            begin_add_to_archive(window, state, archive, inner);
+            return;
+        }
+        (None, None) => {}
     }
     let source_panel = state.active_panel().clone();
     let sources = source_panel.selected_or_cursor();
@@ -1768,11 +2287,24 @@ fn run_copy_move(
 }
 
 fn activate_entry(panel: &Panel, window: &gtk::ApplicationWindow) {
+    if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
+        if is_dir {
+            panel.navigate(&archive.join(inner));
+        } else {
+            with_extracted(window, archive, inner, |window, path| open_file(window, path));
+        }
+        return;
+    }
     let Some(path) = panel.cursor_path() else {
         return;
     };
     match fs::metadata(&path) {
         Ok(metadata) if metadata.is_dir() => panel.navigate(&path),
+        // Like Salamander, Enter on an archive opens it as a directory (Shift+Enter runs
+        // the associated application).
+        Ok(metadata) if metadata.is_file() && archive::looks_like_archive(&path) => {
+            panel.navigate(&path)
+        }
         Ok(metadata) if metadata.is_file() => open_file(window, path),
         Ok(_) => show_error(
             window,

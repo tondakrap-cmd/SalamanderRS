@@ -20,6 +20,7 @@ use crate::model::{
 };
 use crate::ops;
 use crate::sys;
+use crate::xattr;
 
 const TIME_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
 const UNCHANGED: &str = "(neměnit)";
@@ -294,8 +295,22 @@ pub fn open(
             &general,
             &mut row,
             "Oprávnění:",
-            &format!("{}  ({})", format_mode(entry.mode), format_octal(entry.mode)),
+            &format!("{}  ({})", entry.mode_text(), format_octal(entry.mode)),
         );
+        if entry.kind != EntryKind::Symlink {
+            if let Ok(flags) = xattr::get_flags(&entry.path) {
+                let letters = xattr::format_flags(flags);
+                add_info_row(
+                    &general,
+                    &mut row,
+                    "Atributy (lsattr):",
+                    if letters.is_empty() { "—" } else { &letters },
+                );
+            }
+            if entry.has_acl {
+                add_info_row(&general, &mut row, "ACL:", "ano (viz záložka Rozšířené)");
+            }
+        }
         add_info_row(
             &general,
             &mut row,
@@ -594,6 +609,7 @@ pub fn open(
     ctime_note.add_css_class("dim-label");
     times.attach(&ctime_note, 0, 3, 2, 1);
     notebook.append_page(&times, Some(&gtk::Label::with_mnemonic("Č_asy")));
+    let extended = single.then(|| build_extended_page(&notebook, &window, &entries[0]));
 
     if page == Page::Permissions {
         notebook.set_current_page(Some(1));
@@ -681,7 +697,17 @@ pub fn open(
                 _ => Scope::All,
             },
         };
+        // Flags and ACLs of a single item are quick and applied right here.
+        let extended_errors = extended.as_ref().map(|page| page.apply()).unwrap_or_default();
+        let parent = window.transient_for();
         window.close();
+        if !extended_errors.is_empty() {
+            gtk::AlertDialog::builder()
+                .modal(true)
+                .message(format!("Rozšířené atributy:\n{}", extended_errors.join("\n")))
+                .build()
+                .show(parent.as_ref());
+        }
         if change.is_empty() {
             return;
         }
@@ -716,4 +742,428 @@ pub fn describe_change(change: &AttrChange) -> String {
         parts.push("rekurzivně".to_owned());
     }
     parts.join(", ")
+}
+
+struct ExtendedPage {
+    path: PathBuf,
+    is_dir: bool,
+    /// Initial flags and the editable check boxes; `None` when unsupported.
+    flags: Option<(u32, Vec<(u32, gtk::CheckButton)>)>,
+    acl: Option<(gtk::TextView, String)>,
+}
+
+impl ExtendedPage {
+    fn apply(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        if let Some((initial, checks)) = &self.flags {
+            let mut flags = *initial;
+            for (bit, check) in checks {
+                if check.is_active() {
+                    flags |= bit;
+                } else {
+                    flags &= !bit;
+                }
+            }
+            if flags != *initial {
+                if let Err(error) = xattr::set_flags(&self.path, flags) {
+                    let hint = if error.raw_os_error() == Some(libc::EPERM) {
+                        " (příznaky i a a smí měnit jen root)"
+                    } else {
+                        ""
+                    };
+                    errors.push(format!("chattr: {error}{hint}"));
+                }
+            }
+        }
+        if let Some((view, initial)) = &self.acl {
+            let buffer = view.buffer();
+            let text = buffer.text(&buffer.start_iter(), &buffer.end_iter(), false);
+            if text.trim() != initial.trim() {
+                if let Err(error) = xattr::write_acl_text(&self.path, &text, self.is_dir) {
+                    errors.push(format!("ACL: {error}"));
+                }
+            }
+        }
+        errors
+    }
+}
+
+fn section_heading(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("heading");
+    label
+}
+
+fn note(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.set_wrap(true);
+    label.add_css_class("dim-label");
+    label
+}
+
+/// "Extended" tab: filesystem flags (chattr), POSIX ACL and extended attributes.
+fn build_extended_page(notebook: &gtk::Notebook, window: &gtk::Window, entry: &FileEntry) -> Rc<ExtendedPage> {
+    let page = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    page.set_margin_top(12);
+    page.set_margin_bottom(12);
+    page.set_margin_start(12);
+    page.set_margin_end(12);
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.set_child(Some(&page));
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(520);
+    scrolled.set_hscrollbar_policy(gtk::PolicyType::Never);
+    notebook.append_page(&scrolled, Some(&gtk::Label::with_mnemonic("_Rozšířené")));
+
+    let is_symlink = entry.kind == EntryKind::Symlink;
+    let is_dir = entry.kind == EntryKind::Directory;
+    if is_symlink {
+        page.append(&note(
+            "Symbolické odkazy nemají příznaky souborového systému, ACL ani uživatelské \
+             rozšířené atributy. Otevřete vlastnosti cíle odkazu.",
+        ));
+        return Rc::new(ExtendedPage {
+            path: entry.path.clone(),
+            is_dir,
+            flags: None,
+            acl: None,
+        });
+    }
+
+    // ---- chattr ----
+    page.append(&section_heading("Atributy souborového systému (chattr)"));
+    let flags = match xattr::get_flags(&entry.path) {
+        Ok(current) => {
+            let grid = gtk::Grid::new();
+            grid.set_row_spacing(4);
+            grid.set_column_spacing(18);
+            let mut checks = Vec::new();
+            let mut position = 0;
+            for flag in xattr::FLAGS {
+                // Kernel-managed flags are only shown when set.
+                if flag.read_only && current & flag.bit == 0 {
+                    continue;
+                }
+                let check = gtk::CheckButton::with_label(flag.label);
+                check.set_tooltip_text(Some(flag.tooltip));
+                check.set_active(current & flag.bit != 0);
+                check.set_sensitive(!flag.read_only);
+                grid.attach(&check, position % 2, position / 2, 1, 1);
+                position += 1;
+                if !flag.read_only {
+                    checks.push((flag.bit, check));
+                }
+            }
+            page.append(&grid);
+            Some((current, checks))
+        }
+        Err(error) => {
+            page.append(&note(&format!("Souborový systém příznaky nepodporuje ({error}).")));
+            None
+        }
+    };
+
+    // ---- ACL ----
+    page.append(&section_heading("Seznam řízení přístupu (POSIX ACL)"));
+    let acl = match xattr::read_acl_text(&entry.path) {
+        Ok(text) => {
+            let view = gtk::TextView::new();
+            view.set_monospace(true);
+            view.set_top_margin(4);
+            view.set_bottom_margin(4);
+            view.set_left_margin(4);
+            view.buffer().set_text(&text);
+            let frame = gtk::Frame::new(None);
+            let acl_scroll = gtk::ScrolledWindow::new();
+            acl_scroll.set_min_content_height(110);
+            acl_scroll.set_child(Some(&view));
+            frame.set_child(Some(&acl_scroll));
+            page.append(&frame);
+            let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+            let base = gtk::Button::with_mnemonic("Vložit _základ z oprávnění");
+            let mode = entry.mode;
+            let weak_view = view.downgrade();
+            base.connect_clicked(move |_| {
+                if let Some(view) = weak_view.upgrade() {
+                    let rwx = |shift: u32| format_mode(mode)[1 + shift as usize..4 + shift as usize].replace(['s', 't'], "x").replace(['S', 'T'], "-");
+                    let mut text = format!("user::{}\ngroup::{}\nother::{}\n", rwx(0), rwx(3), rwx(6));
+                    if is_dir {
+                        text.push_str(&format!(
+                            "default:user::{}\ndefault:group::{}\ndefault:other::{}\n",
+                            rwx(0),
+                            rwx(3),
+                            rwx(6)
+                        ));
+                    }
+                    view.buffer().set_text(&text);
+                }
+            });
+            let clear = gtk::Button::with_mnemonic("_Odstranit ACL");
+            let weak_view = view.downgrade();
+            clear.connect_clicked(move |_| {
+                if let Some(view) = weak_view.upgrade() {
+                    view.buffer().set_text("");
+                }
+            });
+            row.append(&base);
+            row.append(&clear);
+            page.append(&row);
+            page.append(&note(
+                "Jeden záznam na řádek: user::rwx, user:jméno:r-x, group::r-x, group:jméno:rw-, \
+                 mask::rwx, other::r--. Výchozí ACL adresáře začínají „default:“. Chybějící \
+                 mask se dopočítá. Prázdný text ACL odstraní. Uplatní se tlačítkem Použít.",
+            ));
+            Some((view, text))
+        }
+        Err(error) => {
+            page.append(&note(&format!("ACL nelze načíst ({error}).")));
+            None
+        }
+    };
+
+    // ---- xattr ----
+    page.append(&section_heading("Rozšířené atributy (xattr)"));
+    let list = gtk::ListBox::new();
+    list.set_selection_mode(gtk::SelectionMode::Single);
+    let list_frame = gtk::Frame::new(None);
+    let list_scroll = gtk::ScrolledWindow::new();
+    list_scroll.set_min_content_height(110);
+    list_scroll.set_child(Some(&list));
+    list_frame.set_child(Some(&list_scroll));
+    page.append(&list_frame);
+    let status = note("");
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let add = gtk::Button::with_mnemonic("_Přidat…");
+    let edit = gtk::Button::with_mnemonic("_Upravit…");
+    let remove = gtk::Button::with_mnemonic("_Smazat");
+    buttons.append(&add);
+    buttons.append(&edit);
+    buttons.append(&remove);
+    page.append(&buttons);
+    page.append(&status);
+    page.append(&note(
+        "Změny xattr se uloží ihned. Běžní uživatelé mohou měnit jmenný prostor user.*; \
+         security.* a trusted.* vyžadují oprávnění roota.",
+    ));
+
+    let path = entry.path.clone();
+    let refresh: Rc<dyn Fn()> = {
+        let list = list.downgrade();
+        let status = status.downgrade();
+        let path = path.clone();
+        Rc::new(move || {
+            let (Some(list), Some(status)) = (list.upgrade(), status.upgrade()) else {
+                return;
+            };
+            list.remove_all();
+            match xattr::list(&path) {
+                Ok(names) => {
+                    let names: Vec<String> = names
+                        .into_iter()
+                        .filter(|name| name != xattr::ACL_ACCESS && name != xattr::ACL_DEFAULT)
+                        .collect();
+                    for name in &names {
+                        let value = xattr::get(&path, name)
+                            .map(|value| value.map(|value| xattr::format_value(&value)).unwrap_or_default())
+                            .unwrap_or_else(|error| format!("<{error}>"));
+                        let label = gtk::Label::new(Some(&format!("{name} = {value}")));
+                        label.set_xalign(0.0);
+                        label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+                        label.set_margin_start(4);
+                        label.set_widget_name(name);
+                        list.append(&label);
+                    }
+                    status.set_text(if names.is_empty() { "Žádné rozšířené atributy." } else { "" });
+                }
+                Err(error) => status.set_text(&format!("Nelze načíst: {error}")),
+            }
+        })
+    };
+    refresh();
+
+    let selected_name = {
+        let list = list.downgrade();
+        move || -> Option<String> {
+            list.upgrade()?
+                .selected_row()?
+                .child()
+                .map(|child| child.widget_name().to_string())
+        }
+    };
+    let selected_name = Rc::new(selected_name);
+
+    let open_editor = {
+        let window = window.downgrade();
+        let path = path.clone();
+        let refresh = Rc::clone(&refresh);
+        Rc::new(move |name: Option<String>| {
+            let Some(window) = window.upgrade() else {
+                return;
+            };
+            let value = name
+                .as_deref()
+                .and_then(|name| xattr::get(&path, name).ok().flatten())
+                .map(|value| xattr::format_value(&value))
+                .unwrap_or_default();
+            let path = path.clone();
+            let refresh = Rc::clone(&refresh);
+            let shown_name = name.clone();
+            xattr_editor(&window, shown_name.as_deref(), &value, move |editor, new_name, new_value| {
+                let result = xattr::parse_value(&new_value).and_then(|bytes| {
+                    xattr::set(&path, &new_name, &bytes).map_err(|error| {
+                        if error.raw_os_error() == Some(libc::ENOTSUP) {
+                            format!("{error} — použijte jmenný prostor user., např. user.{new_name}")
+                        } else {
+                            error.to_string()
+                        }
+                    })
+                });
+                // Renaming an attribute: remove the old one after the new one is stored.
+                let result = result.and_then(|()| match &name {
+                    Some(old) if *old != new_name => xattr::remove(&path, old).map_err(|error| error.to_string()),
+                    _ => Ok(()),
+                });
+                match result {
+                    Ok(()) => {
+                        editor.close();
+                        refresh();
+                    }
+                    Err(error) => gtk::AlertDialog::builder()
+                        .modal(true)
+                        .message(format!("Nelze uložit {new_name}: {error}"))
+                        .build()
+                        .show(Some(editor)),
+                }
+            });
+        })
+    };
+    {
+        let open_editor = Rc::clone(&open_editor);
+        add.connect_clicked(move |_| open_editor(None));
+    }
+    {
+        let edit_editor = Rc::clone(&open_editor);
+        let edit_selected = Rc::clone(&selected_name);
+        edit.connect_clicked(move |_| {
+            if let Some(name) = edit_selected() {
+                edit_editor(Some(name));
+            }
+        });
+        let open_editor = Rc::clone(&open_editor);
+        let selected_name = Rc::clone(&selected_name);
+        list.connect_row_activated(move |_, _| {
+            if let Some(name) = selected_name() {
+                open_editor(Some(name));
+            }
+        });
+    }
+    {
+        let path = path.clone();
+        let refresh = Rc::clone(&refresh);
+        let status = status.downgrade();
+        remove.connect_clicked(move |_| {
+            let Some(name) = selected_name() else {
+                return;
+            };
+            match xattr::remove(&path, &name) {
+                Ok(()) => refresh(),
+                Err(error) => {
+                    if let Some(status) = status.upgrade() {
+                        status.set_text(&format!("Nelze smazat {name}: {error}"));
+                    }
+                }
+            }
+        });
+    }
+
+    Rc::new(ExtendedPage {
+        path,
+        is_dir,
+        flags,
+        acl,
+    })
+}
+
+/// Small editor for one extended attribute. `on_save` receives the editor window so it can
+/// stay open when saving fails.
+fn xattr_editor(
+    parent: &gtk::Window,
+    name: Option<&str>,
+    value: &str,
+    on_save: impl Fn(&gtk::Window, String, String) + 'static,
+) {
+    let window = gtk::Window::builder()
+        .transient_for(parent)
+        .modal(true)
+        .title(if name.is_some() { "Upravit atribut" } else { "Přidat atribut" })
+        .default_width(480)
+        .resizable(false)
+        .build();
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    content.set_margin_top(18);
+    content.set_margin_bottom(18);
+    content.set_margin_start(18);
+    content.set_margin_end(18);
+    window.set_child(Some(&content));
+    let grid = gtk::Grid::new();
+    grid.set_row_spacing(6);
+    grid.set_column_spacing(8);
+    let name_entry = gtk::Entry::new();
+    name_entry.set_text(name.unwrap_or("user."));
+    name_entry.set_hexpand(true);
+    let value_entry = gtk::Entry::new();
+    value_entry.set_text(value);
+    value_entry.set_placeholder_text(Some("text, nebo 0x… pro binární hodnotu"));
+    value_entry.set_activates_default(true);
+    for (row, (label, entry)) in [("_Jméno:", &name_entry), ("_Hodnota:", &value_entry)].into_iter().enumerate() {
+        let label = gtk::Label::with_mnemonic(label);
+        label.set_xalign(0.0);
+        label.set_mnemonic_widget(Some(entry));
+        grid.attach(&label, 0, row as i32, 1, 1);
+        grid.attach(entry, 1, row as i32, 1, 1);
+    }
+    content.append(&grid);
+    let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    buttons.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_mnemonic("_Zrušit");
+    let save = gtk::Button::with_mnemonic("_Uložit");
+    save.add_css_class("suggested-action");
+    buttons.append(&cancel);
+    buttons.append(&save);
+    content.append(&buttons);
+    window.set_default_widget(Some(&save));
+    let weak = window.downgrade();
+    cancel.connect_clicked(move |_| {
+        if let Some(window) = weak.upgrade() {
+            window.close();
+        }
+    });
+    let weak = window.downgrade();
+    let (name_input, value_input) = (name_entry.clone(), value_entry.clone());
+    save.connect_clicked(move |_| {
+        let Some(window) = weak.upgrade() else {
+            return;
+        };
+        let name_entry = &name_input;
+        let value_entry = &value_input;
+        let name = name_entry.text().trim().to_owned();
+        if name.is_empty() || !name.contains('.') {
+            gtk::AlertDialog::builder()
+                .modal(true)
+                .message("Jméno musí obsahovat jmenný prostor, např. user.komentar")
+                .build()
+                .show(Some(&window));
+            return;
+        }
+        on_save(&window, name, value_entry.text().to_string());
+    });
+    window.present();
+    if name.is_some() {
+        value_entry.grab_focus();
+    } else {
+        name_entry.grab_focus();
+        name_entry.set_position(-1);
+    }
 }

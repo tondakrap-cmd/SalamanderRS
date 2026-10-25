@@ -23,6 +23,18 @@ fn dialog_window(
     content.set_margin_start(18);
     content.set_margin_end(18);
     window.set_child(Some(&content));
+    let keys = gtk::EventControllerKey::new();
+    let weak_window = window.downgrade();
+    keys.connect_key_pressed(move |_, key, _, _| {
+        if key == gtk::gdk::Key::Escape {
+            if let Some(window) = weak_window.upgrade() {
+                window.close();
+            }
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    window.add_controller(keys);
     (window, content)
 }
 
@@ -57,6 +69,8 @@ pub fn confirm(
     content.append(&label);
     let (buttons, confirm) = dialog_buttons(&window, confirm_label);
     content.append(&buttons);
+    // Enter confirms, Esc cancels.
+    window.set_default_widget(Some(&confirm));
 
     let callback = Rc::new(RefCell::new(Some(on_confirm)));
     let weak_window = window.downgrade();
@@ -69,6 +83,9 @@ pub fn confirm(
         }
     });
     window.present();
+    if let Some(button) = window.default_widget() {
+        button.grab_focus();
+    }
 }
 
 pub fn prompt(
@@ -238,6 +255,8 @@ pub fn info(parent: &gtk::ApplicationWindow, title: &str, text: &str) {
     });
     window.present();
     close.grab_focus();
+    // A selectable label selects all its text when it receives focus first.
+    label.select_region(0, 0);
 }
 
 /// Simple modal progress window with a pulsing bar, a text line and a Cancel button.

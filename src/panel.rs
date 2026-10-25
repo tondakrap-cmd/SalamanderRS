@@ -14,9 +14,10 @@ use gtk::gio;
 use gtk::glib;
 use gtk::prelude::*;
 
+use crate::archive;
 use crate::model::{
-    format_bytes, format_mode, format_modified, read_directory, wildcard_match, CompareItem,
-    DirectoryListing, EntryKind, EntryObject, FileEntry, Mask,
+    format_bytes, format_modified, read_archive_directory, read_directory, wildcard_match,
+    CompareItem, DirectoryListing, EntryKind, EntryObject, FileEntry, Mask,
 };
 use crate::ops;
 use crate::sys::DiskSpace;
@@ -38,8 +39,56 @@ pub enum OptionalColumn {
     Owner,
 }
 
+/// What a panel shows: a real directory, or a directory inside an archive file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Location {
+    Dir(PathBuf),
+    Archive { archive: PathBuf, inner: PathBuf },
+}
+
+impl Location {
+    /// Path shown in the path entry and history; inside archives it is virtual
+    /// (`/data/a.zip/dir`).
+    pub fn display(&self) -> PathBuf {
+        match self {
+            Location::Dir(dir) => dir.clone(),
+            Location::Archive { archive, inner } if inner.as_os_str().is_empty() => archive.clone(),
+            Location::Archive { archive, inner } => archive.join(inner),
+        }
+    }
+
+    /// The real directory: the archive's parent when inside an archive.
+    pub fn fs_dir(&self) -> PathBuf {
+        match self {
+            Location::Dir(dir) => dir.clone(),
+            Location::Archive { archive, .. } => archive
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from("/")),
+        }
+    }
+}
+
+/// Drops `.` and resolves `..` lexically inside an archive.
+fn normalize_inner(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(part) => normalized.push(part),
+            std::path::Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => {}
+        }
+    }
+    normalized
+}
+
 struct PanelState {
-    dir: PathBuf,
+    location: Location,
+    /// Target of the load in flight, so repeated Backspace climbs from where it is going.
+    loading: Option<Location>,
+    note: Option<String>,
     show_hidden: bool,
     generation: Cell<u64>,
     pending_cursor: Option<(PathBuf, PathBuf)>,
@@ -278,7 +327,9 @@ impl Panel {
                 owner,
             }),
             state: Rc::new(RefCell::new(PanelState {
-                dir: start_dir.to_path_buf(),
+                location: Location::Dir(start_dir.to_path_buf()),
+                loading: None,
+                note: None,
                 show_hidden,
                 generation: Cell::new(0),
                 pending_cursor: None,
@@ -321,7 +372,7 @@ impl Panel {
             .view
             .sort_by_column(Some(&panel.columns.name), gtk::SortType::Ascending);
 
-        panel.load(start_dir.to_path_buf(), show_hidden, false);
+        panel.load(Location::Dir(start_dir.to_path_buf()), show_hidden, false);
         panel
     }
 
@@ -329,8 +380,32 @@ impl Panel {
         &self.view
     }
 
+    /// The real directory shown, or the directory containing the open archive.
     pub fn dir(&self) -> PathBuf {
-        self.state.borrow().dir.clone()
+        self.state.borrow().location.fs_dir()
+    }
+
+    pub fn location(&self) -> Location {
+        self.state.borrow().location.clone()
+    }
+
+    /// `(archive file, inner directory)` when the panel shows an archive.
+    pub fn archive(&self) -> Option<(PathBuf, PathBuf)> {
+        match &self.state.borrow().location {
+            Location::Archive { archive, inner } => Some((archive.clone(), inner.clone())),
+            Location::Dir(_) => None,
+        }
+    }
+
+    /// Inner paths of the selected entries when the panel shows an archive.
+    pub fn archive_selection(&self) -> Vec<PathBuf> {
+        let Some((archive, _)) = self.archive() else {
+            return Vec::new();
+        };
+        self.selected_or_cursor()
+            .into_iter()
+            .filter_map(|path| path.strip_prefix(&archive).ok().map(Path::to_path_buf))
+            .collect()
     }
 
     pub fn show_hidden(&self) -> bool {
@@ -346,7 +421,7 @@ impl Panel {
         if expanded.is_absolute() {
             expanded
         } else {
-            self.state.borrow().dir.join(expanded)
+            self.state.borrow().location.display().join(expanded)
         }
     }
 
@@ -399,12 +474,14 @@ impl Panel {
     }
 
     pub fn navigate_parent(&self) {
-        let (dir, parent) = {
+        // Inside an archive the parent of the archive root is the directory containing the
+        // archive file, with the cursor on it — the same as for ordinary directories.
+        let current = {
             let state = self.state.borrow();
-            (state.dir.clone(), state.dir.parent().map(Path::to_path_buf))
+            state.loading.as_ref().unwrap_or(&state.location).display()
         };
-        if let Some(parent) = parent {
-            self.navigate_and_focus(&parent, Some(&dir));
+        if let Some(parent) = current.parent() {
+            self.navigate_and_focus(parent, Some(&current));
         }
     }
 
@@ -474,17 +551,17 @@ impl Panel {
     }
 
     pub fn reload(&self) {
-        let (dir, show_hidden) = {
+        let (location, show_hidden) = {
             let state = self.state.borrow();
-            (state.dir.clone(), state.show_hidden)
+            (state.location.clone(), state.show_hidden)
         };
-        self.load(dir, show_hidden, false);
+        self.load(location, show_hidden, false);
     }
 
     pub fn reload_and_focus(&self, path: &Path) {
         {
             let mut state = self.state.borrow_mut();
-            state.pending_cursor = Some((state.dir.clone(), path.to_path_buf()));
+            state.pending_cursor = Some((state.location.display(), path.to_path_buf()));
         }
         self.reload();
     }
@@ -499,29 +576,41 @@ impl Panel {
         self.quick_search_end();
 
         let candidate = self.resolve_path(requested);
-        let candidate = match fs::canonicalize(&candidate) {
-            Ok(candidate) if candidate.is_dir() => candidate,
-            Ok(candidate) => {
+        let location = match fs::canonicalize(&candidate) {
+            Ok(path) if path.is_dir() => Location::Dir(path),
+            Ok(path) if path.is_file() && archive::looks_like_archive(&path) => Location::Archive {
+                archive: path,
+                inner: PathBuf::new(),
+            },
+            Ok(path) => {
                 self.fail_navigation(&format!(
                     "Nelze číst adresář {}: není adresář",
-                    candidate.to_string_lossy()
+                    path.to_string_lossy()
                 ));
                 return;
             }
-            Err(error) => {
-                self.fail_navigation(&format!(
-                    "Nelze číst adresář {}: {error}",
-                    candidate.to_string_lossy()
-                ));
-                return;
-            }
+            Err(error) => match archive::split_virtual(&candidate) {
+                // A path inside an archive, e.g. typed into the path entry or from history.
+                Some((file, inner)) => Location::Archive {
+                    archive: fs::canonicalize(&file).unwrap_or(file),
+                    inner: normalize_inner(&inner),
+                },
+                None => {
+                    self.fail_navigation(&format!(
+                        "Nelze číst adresář {}: {error}",
+                        candidate.to_string_lossy()
+                    ));
+                    return;
+                }
+            },
         };
 
         if let Some(name) = focus.and_then(Path::file_name) {
-            self.state.borrow_mut().pending_cursor = Some((candidate.clone(), candidate.join(name)));
+            let display = location.display();
+            self.state.borrow_mut().pending_cursor = Some((display.clone(), display.join(name)));
         }
         let show_hidden = self.state.borrow().show_hidden;
-        self.load(candidate, show_hidden, false);
+        self.load(location, show_hidden, false);
     }
 
     fn fail_navigation(&self, message: &str) {
@@ -778,10 +867,14 @@ impl Panel {
 
     /// Moves the cursor (selection and keyboard focus) to `position` and scrolls to it.
     pub fn move_cursor(&self, position: u32) {
+        self.move_cursor_focus(position, self.has_focus());
+    }
+
+    fn move_cursor_focus(&self, position: u32, focus: bool) {
         if position >= self.sorted.n_items() {
             return;
         }
-        if self.has_focus() {
+        if focus {
             self.view.scroll_to(
                 position,
                 None::<&gtk::ColumnViewColumn>,
@@ -814,21 +907,27 @@ impl Panel {
         }
     }
 
-    fn load(&self, dir: PathBuf, show_hidden: bool, quiet: bool) {
+    fn load(&self, location: Location, show_hidden: bool, quiet: bool) {
         let generation = self.state.borrow().generation.get().wrapping_add(1);
         self.state.borrow().generation.set(generation);
-        self.path_entry.set_text(&dir.to_string_lossy());
+        self.state.borrow_mut().loading = Some(location.clone());
+        self.path_entry.set_text(&location.display().to_string_lossy());
 
         let (sender, receiver) = async_channel::bounded(1);
-        let worker_dir = dir.clone();
+        let worker_location = location.clone();
         std::thread::spawn(move || {
-            let result = read_directory(&worker_dir, show_hidden);
-            let _ = sender.send_blocking((generation, worker_dir, result));
+            let result = match &worker_location {
+                Location::Dir(dir) => read_directory(dir, show_hidden),
+                Location::Archive { archive, inner } => {
+                    read_archive_directory(archive, inner, show_hidden)
+                }
+            };
+            let _ = sender.send_blocking((generation, worker_location, result));
         });
 
         let weak = self.downgrade();
         glib::spawn_future_local(async move {
-            let Ok((generation, dir, result)) = receiver.recv().await else {
+            let Ok((generation, location, result)) = receiver.recv().await else {
                 return;
             };
             let Some(panel) = weak.upgrade() else {
@@ -837,15 +936,16 @@ impl Panel {
             if panel.state.borrow().generation.get() != generation {
                 return;
             }
+            panel.state.borrow_mut().loading = None;
             match result {
-                Ok(listing) => panel.apply_listing(dir, listing, quiet),
+                Ok(listing) => panel.apply_listing(location, listing, quiet),
                 Err(error) => {
                     panel.state.borrow_mut().pending_history = None;
                     panel.restore_path_entry();
                     if !quiet {
                         panel.show_message(&format!(
                             "Nelze číst adresář {}: {error}",
-                            dir.to_string_lossy()
+                            location.display().to_string_lossy()
                         ));
                     }
                 }
@@ -853,8 +953,12 @@ impl Panel {
         });
     }
 
-    fn apply_listing(&self, dir: PathBuf, listing: DirectoryListing, quiet: bool) {
-        let same_directory = self.state.borrow().dir == dir;
+    fn apply_listing(&self, location: Location, listing: DirectoryListing, quiet: bool) {
+        let same_directory = self.state.borrow().location == location;
+        let dir = location.display();
+        // Replacing the rows destroys the focused row widget, so remember whether the list
+        // had keyboard focus and give it back afterwards.
+        let had_focus = self.has_focus();
         let previous_cursor = same_directory.then(|| self.cursor_path()).flatten();
         let previous_position = self.selection.selected();
         let mut marked_paths = HashSet::new();
@@ -890,8 +994,9 @@ impl Panel {
 
         {
             let mut state = self.state.borrow_mut();
-            state.dir = dir.clone();
+            state.location = location.clone();
             state.disk_space = listing.disk_space;
+            state.note = listing.note.clone();
             match state.pending_history.take() {
                 Some(position) => state.history_pos = position,
                 None => {
@@ -908,7 +1013,10 @@ impl Panel {
             }
         }
         self.path_entry.set_text(&dir.to_string_lossy());
-        self.watch_directory(&dir);
+        match &location {
+            Location::Dir(real) => self.watch_directory(real),
+            Location::Archive { .. } => self.unwatch(),
+        }
 
         let pending_path = {
             let mut state = self.state.borrow_mut();
@@ -935,7 +1043,10 @@ impl Panel {
             })
             .or_else(|| (count > 0).then_some(0));
         if let Some(position) = position {
-            self.move_cursor(position);
+            self.move_cursor_focus(position, had_focus);
+        }
+        if had_focus && !self.has_focus() {
+            self.view.grab_focus();
         }
         self.update_info();
         self.update_status();
@@ -988,6 +1099,14 @@ impl Panel {
         state.monitored_dir = Some(dir.to_path_buf());
     }
 
+    fn unwatch(&self) {
+        let mut state = self.state.borrow_mut();
+        if let Some(old) = state.monitor.take() {
+            old.cancel();
+        }
+        state.monitored_dir = None;
+    }
+
     fn schedule_refresh(&self) {
         if std::mem::replace(&mut self.state.borrow_mut().refresh_pending, true) {
             return;
@@ -995,12 +1114,12 @@ impl Panel {
         let weak = self.downgrade();
         glib::timeout_add_local_once(Duration::from_millis(300), move || {
             if let Some(panel) = weak.upgrade() {
-                let (dir, show_hidden) = {
+                let (location, show_hidden) = {
                     let mut state = panel.state.borrow_mut();
                     state.refresh_pending = false;
-                    (state.dir.clone(), state.show_hidden)
+                    (state.location.clone(), state.show_hidden)
                 };
-                panel.load(dir, show_hidden, true);
+                panel.load(location, show_hidden, true);
             }
         });
     }
@@ -1025,7 +1144,7 @@ impl Panel {
                     format!(
                         "{text}   {size}   {}   {}   {}:{}",
                         format_modified(item.modified),
-                        format_mode(item.mode),
+                        item.mode_text(),
                         item.owner,
                         item.group
                     )
@@ -1073,6 +1192,9 @@ impl Panel {
                 format_bytes(totals.bytes)
             )
         };
+        if let Some(note) = &self.state.borrow().note {
+            text.insert_str(0, &format!("{note}   |   "));
+        }
         if let Some(space) = self.state.borrow().disk_space {
             text.push_str(&format!(
                 "   |   Volno {} z {}",
@@ -1095,10 +1217,11 @@ impl Panel {
     fn invalidate_loads(&self) {
         let generation = self.state.borrow().generation.get().wrapping_add(1);
         self.state.borrow().generation.set(generation);
+        self.state.borrow_mut().loading = None;
     }
 
     fn restore_path_entry(&self) {
-        let dir = self.state.borrow().dir.clone();
+        let dir = self.state.borrow().location.display();
         self.path_entry.set_text(&dir.to_string_lossy());
     }
 
@@ -1290,7 +1413,7 @@ fn update_cell(kind: CellKind, child: &gtk::Widget, entry: &EntryObject) {
         CellKind::Extension => entry.with_entry(|item| item.extension().to_owned()),
         CellKind::Size => entry.display_size(),
         CellKind::Modified => entry.with_entry(|item| format_modified(item.modified)),
-        CellKind::Permissions => entry.with_entry(|item| format_mode(item.mode)),
+        CellKind::Permissions => entry.with_entry(FileEntry::mode_text),
         CellKind::Owner => entry.with_entry(|item| format!("{}:{}", item.owner, item.group)),
     };
     label.set_text(&text);

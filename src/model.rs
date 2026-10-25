@@ -42,11 +42,22 @@ pub struct FileEntry {
     pub link_target: Option<PathBuf>,
     /// For symlinks: whether the (followed) target is a directory.
     pub target_is_dir: bool,
+    /// Has a POSIX ACL beyond the permission bits (shown as `+` like `ls -l`).
+    pub has_acl: bool,
 }
 
 impl FileEntry {
     pub fn is_dir_like(&self) -> bool {
         self.kind == EntryKind::Directory || (self.kind == EntryKind::Symlink && self.target_is_dir)
+    }
+
+    /// Permission string with the `+` ACL marker, e.g. "drwxr-x---+".
+    pub fn mode_text(&self) -> String {
+        let mut text = format_mode(self.mode);
+        if self.has_acl {
+            text.push('+');
+        }
+        text
     }
 
     pub fn is_hidden(&self) -> bool {
@@ -141,6 +152,7 @@ pub fn entry_from_metadata(
         inode: metadata.ino(),
         link_target,
         target_is_dir,
+        has_acl: kind != EntryKind::Symlink && crate::xattr::has_extended_acl(&path),
         path,
     }
 }
@@ -172,6 +184,8 @@ pub struct DirectoryListing {
     pub entries: Vec<FileEntry>,
     pub warnings: Vec<OpError>,
     pub disk_space: Option<DiskSpace>,
+    /// Extra status information, e.g. the archive format.
+    pub note: Option<String>,
 }
 
 pub fn read_directory(path: &Path, show_hidden: bool) -> io::Result<DirectoryListing> {
@@ -214,6 +228,57 @@ pub fn read_directory(path: &Path, show_hidden: bool) -> io::Result<DirectoryLis
         entries,
         warnings,
         disk_space: sys::disk_space(path),
+        note: None,
+    })
+}
+
+/// Lists directory `inner` of an archive as if it were a real directory; entry paths are
+/// virtual (`archive/inner/name`).
+pub fn read_archive_directory(archive: &Path, inner: &Path, show_hidden: bool) -> io::Result<DirectoryListing> {
+    let index = crate::archive::index(archive).map_err(io::Error::other)?;
+    let children = index
+        .children(inner)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "adresář v archivu neexistuje"))?;
+    let entries = children
+        .into_iter()
+        .filter_map(|member| {
+            let name = member.path.file_name()?.to_os_string();
+            let folded_name = name.to_string_lossy().to_lowercase();
+            if !show_hidden && folded_name.starts_with('.') {
+                return None;
+            }
+            Some(FileEntry {
+                path: archive.join(&member.path),
+                folded_name,
+                name,
+                kind: member.kind,
+                size: member.size,
+                modified: member.modified,
+                accessed: None,
+                changed: None,
+                created: None,
+                mode: member.mode,
+                uid: 0,
+                gid: 0,
+                owner: member.owner,
+                group: member.group,
+                nlink: 1,
+                inode: 0,
+                link_target: member.link_target,
+                target_is_dir: false,
+                has_acl: false,
+            })
+        })
+        .collect();
+    let mut note = format!("Archiv: {}", index.format);
+    if !index.is_writable() {
+        note.push_str(" (jen pro čtení)");
+    }
+    Ok(DirectoryListing {
+        entries,
+        warnings: Vec::new(),
+        disk_space: archive.parent().and_then(sys::disk_space),
+        note: Some(note),
     })
 }
 

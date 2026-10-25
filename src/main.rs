@@ -1,3 +1,5 @@
+mod archive;
+mod archive_ui;
 mod attrs;
 mod clipboard;
 mod config;
@@ -11,6 +13,7 @@ mod props;
 mod sys;
 mod viewer;
 mod window;
+mod xattr;
 
 use std::path::PathBuf;
 
@@ -28,13 +31,15 @@ fn main() -> gtk::glib::ExitCode {
             PathBuf::from(&arg)
         }
     });
+    // Directories and archives are opened directly; for other files their directory.
     let open_dir = open_dir.map(|path| {
-        if path.is_dir() {
+        if path.is_dir() || archive::looks_like_archive(&path) {
             path
         } else {
             path.parent().map(PathBuf::from).unwrap_or(path)
         }
     });
+    archive::cleanup_temp();
 
     let app = gtk::Application::builder()
         .application_id("cz.k4.salamander-rs")

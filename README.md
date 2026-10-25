@@ -43,6 +43,25 @@ Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
   včetně sémantiky `chmod X`
 - symbolické odkazy se nesledují: mění se vlastník a časy odkazu, ne cíle
 
+**Archivy** (přes systémovou knihovnu libarchive)
+- Enter na archivu ho otevře jako adresář, Backspace z kořene archivu vyjde ven;
+  čtení zvládá zip, tar.gz/xz/zst/bz2, 7z, rar, iso, cpio, deb, rpm, cab a další
+- F3/Enter na souboru v archivu ho rozbalí do soukromého dočasného adresáře a zobrazí/otevře
+- F5 z archivu rozbalí vybrané položky, F5 do otevřeného archivu soubory přidá
+  (stejnojmenné nahradí), F8 v archivu položky odstraní — zápis do zip, tar.*, 7z a cpio
+- Alt+F5 zabalí výběr (zip, tar.gz, tar.xz, tar.zst, tar.bz2, tar, 7z),
+  Alt+F9 rozbalí vybrané archivy, volitelně každý do vlastní složky
+- ochrana proti „zip slip“: položky s `..` nebo cestou přes symbolický odkaz se nerozbalí,
+  bity setuid/setgid se z archivu neobnovují
+
+**Rozšířené atributy** (záložka *Rozšířené* ve Vlastnostech)
+- příznaky souborového systému jako `chattr`/`lsattr` (neměnný, jen připisovat,
+  nezálohovat, bez copy-on-write, …)
+- POSIX ACL ve formátu `getfacl`/`setfacl` včetně výchozích ACL adresářů; mask se dopočítá;
+  soubory s ACL mají ve sloupci Práva značku `+` jako v `ls -l`
+- seznam, přidání, úprava a mazání xattr (text i binární hodnoty `0x…`)
+- kopírování zachovává uživatelské xattr i ACL
+
 **Prohlížeč (F3)** — text/hex (H), zalamování (W), hledání (Ctrl+F, F3/Shift+F3), Esc zavře.
 
 Úplný přehled kláves je v aplikaci pod F1.
@@ -52,7 +71,7 @@ Cílí na Ubuntu 24.04 a novější, včetně LXQt (X11 i Wayland).
 Na Ubuntu 24.04+ (nebo ve WSL2 s WSLg):
 
 ```bash
-sudo apt install build-essential pkg-config libgtk-4-dev
+sudo apt install build-essential pkg-config libgtk-4-dev libarchive13t64
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # Rust ≥ 1.85
 cargo test
 cargo run -- ~/Dokumenty        # volitelně adresář pro levý panel

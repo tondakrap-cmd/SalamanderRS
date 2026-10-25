@@ -310,7 +310,7 @@ mod tests {
             scope: Scope::FilesOnly,
             ..AttrChange::default()
         };
-        let result = apply(&[root.clone()], &change, &AtomicBool::new(false), |_, _| {});
+        let result = apply(std::slice::from_ref(&root), &change, &AtomicBool::new(false), |_, _| {});
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(mode_of(&root.join("plain.txt")), 0o644);
         assert_eq!(mode_of(&root.join("sub/run.sh")), 0o755);
@@ -336,7 +336,7 @@ mod tests {
             recursive: true,
             ..AttrChange::default()
         };
-        let result = apply(&[root.clone()], &change, &AtomicBool::new(false), |_, _| {});
+        let result = apply(std::slice::from_ref(&root), &change, &AtomicBool::new(false), |_, _| {});
         let root_mode = mode_of(&root);
         set_mode(&root, 0o700);
         assert!(result.errors.is_empty(), "{:?}", result.errors);
@@ -364,7 +364,7 @@ mod tests {
             modified: Some(modified),
             ..AttrChange::default()
         };
-        let result = apply(&[link.clone()], &change, &AtomicBool::new(false), |_, _| {});
+        let result = apply(std::slice::from_ref(&link), &change, &AtomicBool::new(false), |_, _| {});
         assert!(result.errors.is_empty(), "{:?}", result.errors);
         assert_eq!(mode_of(&target), 0o600);
         assert_eq!(fs::symlink_metadata(&link).unwrap().mtime(), 1_500_000_000);
@@ -401,7 +401,7 @@ mod tests {
             }),
             ..AttrChange::default()
         };
-        let result = apply(&[path.clone()], &change, &AtomicBool::new(true), |_, _| {});
+        let result = apply(std::slice::from_ref(&path), &change, &AtomicBool::new(true), |_, _| {});
         assert!(result.cancelled);
         assert_eq!(mode_of(&path), 0o600);
     }

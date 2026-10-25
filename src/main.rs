@@ -15,6 +15,7 @@ mod remote_ui;
 mod settings;
 mod sodium;
 mod sys;
+mod terminal;
 mod vault;
 mod viewer;
 mod window;
@@ -41,7 +42,9 @@ fn main() -> gtk::glib::ExitCode {
         }
     });
     // Directories and archives are opened directly; for other files their directory.
+    // Relative paths (`salamander-rs .`) are made absolute.
     let open_dir = open_dir.map(|path| {
+        let path = std::fs::canonicalize(&path).unwrap_or(path);
         if path.is_dir() || archive::looks_like_archive(&path) {
             path
         } else {
@@ -49,6 +52,7 @@ fn main() -> gtk::glib::ExitCode {
         }
     });
     archive::cleanup_temp();
+    remote::askpass::cleanup_stale();
 
     let app = gtk::Application::builder()
         .application_id("cz.k4.salamander-rs")

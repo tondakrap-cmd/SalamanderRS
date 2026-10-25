@@ -1038,6 +1038,16 @@ impl Panel {
                 Err(error) => {
                     panel.state.borrow_mut().pending_history = None;
                     panel.restore_path_entry();
+                    // The shown directory was deleted or unmounted: go to the nearest
+                    // existing parent instead of showing entries that no longer exist.
+                    if let Location::Dir(dir) = &location {
+                        if quiet && panel.state.borrow().location == location && !dir.is_dir() {
+                            if let Some(parent) = dir.ancestors().skip(1).find(|parent| parent.is_dir()) {
+                                panel.navigate(parent);
+                            }
+                            return;
+                        }
+                    }
                     if !quiet {
                         panel.show_message(&format!(
                             "Nelze číst adresář {}: {error}",

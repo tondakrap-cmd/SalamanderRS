@@ -43,14 +43,11 @@ pub fn classify(prompt: &str) -> PromptKind {
 
 /// Private directory for sockets (askpass and ssh ControlMaster), mode 0700.
 pub fn runtime_dir() -> io::Result<PathBuf> {
-    let base = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .unwrap_or_else(|| std::env::temp_dir().join(format!("salamander-rs-{}", crate::sys::effective_uid())));
-    let dir = if base.ends_with(format!("salamander-rs-{}", crate::sys::effective_uid())) {
-        base
-    } else {
-        base.join("salamander-rs")
+    // Without XDG_RUNTIME_DIR a directory of its own in /tmp: the temporary-file directory
+    // `salamander-rs-<uid>` is swept at startup and must not hold sockets.
+    let dir = match std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from).filter(|path| path.is_dir()) {
+        Some(base) => base.join("salamander-rs"),
+        None => std::env::temp_dir().join(format!("salamander-rs-run-{}", crate::sys::effective_uid())),
     };
     std::fs::create_dir_all(&dir)?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
@@ -60,6 +57,34 @@ pub fn runtime_dir() -> io::Result<PathBuf> {
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "runtime adresář nepatří uživateli"));
     }
     Ok(dir)
+}
+
+/// Removes askpass sockets of instances that are no longer running (killed or crashed) and
+/// terminal scripts that were never started.
+pub fn cleanup_stale() {
+    let Ok(dir) = runtime_dir() else { return };
+    let Ok(entries) = std::fs::read_dir(&dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let stale = match name.strip_prefix("askpass-") {
+            Some(rest) => {
+                let pid = rest.split('-').next().unwrap_or_default();
+                pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) || !Path::new("/proc").join(pid).exists()
+            }
+            // Another instance may be about to start one, so only old scripts are removed.
+            None => {
+                name.starts_with("term-")
+                    && name.ends_with(".sh")
+                    && entry
+                        .metadata()
+                        .and_then(|metadata| metadata.modified())
+                        .is_ok_and(|modified| modified.elapsed().unwrap_or_default() > Duration::from_secs(60))
+            }
+        };
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 type Handler = dyn Fn(PromptKind, &str) -> Option<Secret> + Send + Sync;
@@ -73,7 +98,7 @@ pub struct AskpassServer {
 
 impl AskpassServer {
     pub fn start(handler: Box<Handler>) -> io::Result<AskpassServer> {
-        let socket = runtime_dir()?.join(format!("askpass-{}", sodium::random_hex(8)));
+        let socket = runtime_dir()?.join(format!("askpass-{}-{}", std::process::id(), sodium::random_hex(8)));
         let listener = UnixListener::bind(&socket)?;
         std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600))?;
         listener.set_nonblocking(true)?;

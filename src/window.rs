@@ -3,7 +3,6 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
@@ -26,6 +25,7 @@ use crate::panel::{OptionalColumn, Panel, SortKey};
 use crate::places;
 use crate::props;
 use crate::settings;
+use crate::terminal;
 use crate::viewer;
 
 #[path = "window_remote.rs"]
@@ -464,7 +464,7 @@ fn set_active_panel(state: &WindowState, active: WhichPanel) {
 }
 
 fn activate(window: &gtk::ApplicationWindow, action: &str) {
-    let _ = gio::prelude::ActionGroupExt::activate_action(window, action, None);
+    gio::prelude::ActionGroupExt::activate_action(window, action, None);
 }
 
 /// Character typed without Ctrl/Alt/Super, used for quick search.
@@ -797,7 +797,7 @@ fn install_actions(
     action("invert-marks", &[], |_, state| state.active_panel().invert_marks());
     action("select-group", &[], |window, state| begin_mark_group(window, state, true));
     action("unselect-group", &[], |window, state| begin_mark_group(window, state, false));
-    action("compare", &["<Shift>F2"], |window, state| compare_directories(window, state));
+    action("compare", &["<Shift>F2"], compare_directories);
 
     // View.
     action("toggle-hidden", &["<Control>h"], |_, state| {
@@ -851,7 +851,7 @@ fn install_actions(
             remote_open_external(window, state);
         } else if let Some((archive, inner, is_dir)) = archive_cursor(panel) {
             if !is_dir {
-                with_extracted(window, archive, inner, |window, path| open_file(window, path));
+                with_extracted(window, archive, inner, open_file);
             }
         } else if let Some(path) = panel.cursor_path() {
             open_file(window, path);
@@ -2374,8 +2374,10 @@ impl OperationUi {
             }
             glib::Propagation::Proceed
         });
+        // Presenting may run handlers that touch `conflict`, so no borrow is held meanwhile.
+        let window = prompt.window.clone();
         *self.conflict.borrow_mut() = Some(prompt);
-        self.conflict.borrow().as_ref().unwrap().window.present();
+        window.present();
     }
 
     fn close_conflict(&self) {
@@ -2460,7 +2462,7 @@ fn activate_entry(panel: &Panel, window: &gtk::ApplicationWindow) {
         if is_dir {
             panel.navigate(&archive.join(inner));
         } else {
-            with_extracted(window, archive, inner, |window, path| open_file(window, path));
+            with_extracted(window, archive, inner, open_file);
         }
         return;
     }
@@ -2489,16 +2491,7 @@ fn activate_entry(panel: &Panel, window: &gtk::ApplicationWindow) {
     }
 }
 
-/// Runs a command in the background and reaps it so no zombie process is left behind.
-fn spawn_detached(command: &mut Command) -> io::Result<()> {
-    let mut child = command.spawn()?;
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
-    Ok(())
-}
-
-/// Opens a file in the desktop's default text editor (F4), falling back to xdg-open.
+/// Opens a file in the desktop's default text editor (F4), falling back to its own type.
 fn edit_file(window: &gtk::ApplicationWindow, path: &Path) {
     let Some(app) = gio::AppInfo::default_for_type("text/plain", false) else {
         open_file(window, path.to_path_buf());
@@ -2511,35 +2504,9 @@ fn edit_file(window: &gtk::ApplicationWindow, path: &Path) {
 }
 
 fn open_terminal(window: &gtk::ApplicationWindow, dir: &Path) {
-    let mut candidates: Vec<String> = env::var("TERMINAL").into_iter().collect();
-    candidates.extend(
-        [
-            "x-terminal-emulator",
-            "qterminal",
-            "gnome-terminal",
-            "konsole",
-            "xfce4-terminal",
-            "lxterminal",
-            "kitty",
-            "alacritty",
-            "xterm",
-        ]
-        .map(String::from),
-    );
-    for candidate in candidates {
-        match spawn_detached(Command::new(&candidate).current_dir(dir)) {
-            Ok(()) => return,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                show_error(window, &format!("Nelze spustit {candidate}: {error}"));
-                return;
-            }
-        }
+    if let Err(message) = terminal::launch(dir, None) {
+        show_error(window, &message);
     }
-    show_error(
-        window,
-        "Nenalezen žádný emulátor terminálu (nastavte proměnnou TERMINAL)",
-    );
 }
 
 /// Opens a file in its default application (mimeapps.list via GIO). xdg-open is not used:
@@ -2563,7 +2530,7 @@ fn open_file(window: &gtk::ApplicationWindow, path: PathBuf) {
 
 fn launch_app(window: &gtk::ApplicationWindow, app: &gio::AppInfo, file: &gio::File) {
     let context = WidgetExt::display(window).app_launch_context();
-    if let Err(error) = app.launch(&[file.clone()], Some(&context)) {
+    if let Err(error) = app.launch(std::slice::from_ref(file), Some(&context)) {
         show_error(window, &format!("Nelze spustit {}: {error}", app.name()));
     }
 }

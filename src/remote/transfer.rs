@@ -102,10 +102,16 @@ impl Job<'_> {
                 Err(error) => self.fail(remote, Some(local), error),
             }
         } else if attrs.is_file() {
-            if let Err(error) = prepare_local_target(local, self.overwrite) {
-                return self.fail(remote, Some(local), error);
+            match fs::symlink_metadata(local) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => return self.fail(remote, Some(local), error),
+                Ok(_) if !self.overwrite => return self.fail(remote, Some(local), "cíl již existuje"),
+                Ok(metadata) if metadata.is_dir() => return self.fail(remote, Some(local), "cíl je adresář"),
+                _ => {}
             }
-            let file = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(local) {
+            // The data goes to a temporary file next to the target, which replaces the target
+            // only when complete: a failed transfer never destroys an existing file.
+            let part = partial_path(local);
+            let file = match fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&part) {
                 Ok(file) => file,
                 Err(error) => return self.fail(remote, Some(local), error),
             };
@@ -118,17 +124,20 @@ impl Job<'_> {
                 }
             });
             drop(file);
+            let outcome = outcome.and_then(|bytes| {
+                // Never recreate setuid/setgid bits from a remote server.
+                let mode = attrs.permissions.unwrap_or(0o644) & 0o1777;
+                let _ = fs::set_permissions(&part, fs::Permissions::from_mode(mode));
+                set_local_times(&part, &attrs);
+                fs::rename(&part, local).map(|()| bytes).map_err(|error| SftpError::Io(error.to_string()))
+            });
             match outcome {
                 Ok(bytes) => {
-                    // Never recreate setuid/setgid bits from a remote server.
-                    let mode = attrs.permissions.unwrap_or(0o644) & 0o1777;
-                    let _ = fs::set_permissions(local, fs::Permissions::from_mode(mode));
-                    set_local_times(local, &attrs);
                     self.result.done += 1;
                     log::log(&self.label, "DOWNLOAD", &format!("{} -> {} ({})", remote.to_string_lossy(), local.to_string_lossy(), format_bytes(bytes)));
                 }
                 Err(error) => {
-                    let _ = fs::remove_file(local);
+                    let _ = fs::remove_file(&part);
                     if matches!(error, SftpError::Cancelled) {
                         self.result.cancelled = true;
                         log::log(&self.label, "CANCEL", &format!("stahování {}", remote.to_string_lossy()));
@@ -200,7 +209,7 @@ impl Job<'_> {
                 Err(error) => self.fail(local, Some(remote), error),
             }
         } else if metadata.is_file() {
-            let fresh = match existing {
+            let fresh = match &existing {
                 Some(attrs) if attrs.is_dir() => return self.fail(local, Some(remote), "cíl je adresář"),
                 Some(_) if !self.overwrite => return self.fail(local, Some(remote), "cíl již existuje"),
                 Some(_) => false,
@@ -210,30 +219,48 @@ impl Job<'_> {
                 Ok(file) => file,
                 Err(error) => return self.fail(local, Some(remote), error),
             };
-            let flags = sftp::OPEN_WRITE
-                | sftp::OPEN_CREATE
-                | if fresh { sftp::OPEN_EXCLUSIVE } else { sftp::OPEN_TRUNCATE };
             let attrs = Attrs {
                 permissions: Some(metadata.mode() & 0o777),
                 ..Attrs::default()
             };
+            // An existing regular file is replaced through a temporary file and an atomic
+            // rename, so a failed transfer leaves it intact. Without posix-rename, write
+            // access to the directory or for symlinks it is overwritten in place like scp.
+            let staged = existing
+                .as_ref()
+                .filter(|existing| existing.is_file())
+                .and_then(|existing| self.stage_upload(remote, existing.permissions.unwrap_or(0o644) & 0o7777));
+            let (target, flags) = match &staged {
+                Some(part) => (part.as_path(), sftp::OPEN_WRITE | sftp::OPEN_TRUNCATE),
+                None if fresh => (remote, sftp::OPEN_WRITE | sftp::OPEN_CREATE | sftp::OPEN_EXCLUSIVE),
+                None => (remote, sftp::OPEN_WRITE | sftp::OPEN_CREATE | sftp::OPEN_TRUNCATE),
+            };
             let progress = &mut self.progress;
             let mut last = std::time::Instant::now();
-            let outcome = self.sftp.upload(&mut file, remote, flags, &attrs, self.cancel, &mut |_| {
+            let mut outcome = self.sftp.upload(&mut file, target, flags, &attrs, self.cancel, &mut |_| {
                 if last.elapsed() > Duration::from_millis(200) {
                     last = std::time::Instant::now();
                     progress(local);
                 }
             });
+            // Like `scp -p`: keep modification and access times.
+            if outcome.is_ok() {
+                let _ = self.sftp.setstat(target, &times_of(&metadata));
+            }
+            if let (Some(part), Ok(_)) = (&staged, &outcome) {
+                if let Err(error) = self.sftp.rename(part, remote) {
+                    outcome = Err(error);
+                }
+            }
             match outcome {
                 Ok(bytes) => {
-                    // Like `scp -p`: keep modification and access times.
-                    let _ = self.sftp.setstat(remote, &times_of(&metadata));
                     self.result.done += 1;
                     log::log(&self.label, "UPLOAD", &format!("{} -> {} ({})", local.to_string_lossy(), remote.to_string_lossy(), format_bytes(bytes)));
                 }
                 Err(error) => {
-                    if fresh {
+                    if let Some(part) = &staged {
+                        let _ = self.sftp.remove(part);
+                    } else if fresh {
                         let _ = self.sftp.remove(remote);
                     }
                     if matches!(error, SftpError::Cancelled) {
@@ -247,6 +274,30 @@ impl Job<'_> {
         } else {
             self.fail(local, Some(remote), "nepodporovaný typ souboru");
         }
+    }
+
+    /// Creates an empty temporary file next to `remote` with the given permissions; `None`
+    /// when the server cannot replace files atomically or the directory is not writable.
+    fn stage_upload(&mut self, remote: &Path, permissions: u32) -> Option<PathBuf> {
+        if !self.sftp.has_extension("posix-rename@openssh.com") {
+            return None;
+        }
+        let part = partial_path(remote);
+        let attrs = Attrs {
+            permissions: Some(permissions),
+            ..Attrs::default()
+        };
+        let handle = self
+            .sftp
+            .open(&part, sftp::OPEN_WRITE | sftp::OPEN_CREATE | sftp::OPEN_EXCLUSIVE, &attrs)
+            .ok()?;
+        let created = self.sftp.close(&handle);
+        // The server's umask may have dropped bits; keep the permissions of the replaced file.
+        if created.is_err() || self.sftp.setstat(&part, &attrs).is_err() {
+            let _ = self.sftp.remove(&part);
+            return None;
+        }
+        Some(part)
     }
 
     fn delete(&mut self, remote: &Path) {
@@ -300,6 +351,11 @@ fn prepare_local_target(local: &Path, overwrite: bool) -> Result<(), String> {
         Ok(metadata) if metadata.is_dir() => Err("cíl je adresář".to_owned()),
         Ok(_) => fs::remove_file(local).map_err(|error| error.to_string()),
     }
+}
+
+/// Hidden temporary name in the same directory as `target` (so a rename can replace it).
+fn partial_path(target: &Path) -> PathBuf {
+    target.with_file_name(format!(".salamander-part-{}", crate::sodium::random_hex(6)))
 }
 
 fn set_local_times(local: &Path, attrs: &Attrs) {
@@ -523,9 +579,26 @@ mod tests {
         assert!(forced.errors.is_empty(), "{:?}", forced.errors);
         assert_eq!(fs::read_to_string(remote.join("dir/a.txt")).unwrap(), "changed");
 
+        // Overwriting goes through a temporary file: the replaced file keeps its permissions
+        // and nothing is left behind on either side.
+        fs::set_permissions(remote.join("dir/a.txt"), fs::Permissions::from_mode(0o640)).unwrap();
+        fs::write(local.join("dir/a.txt"), "third").unwrap();
+        let staged = upload_with(&mut sftp, "test".to_owned(), &[local.join("dir/a.txt")], &remote.join("dir"), true, &no, &mut |_| {});
+        assert!(staged.errors.is_empty(), "{:?}", staged.errors);
+        assert_eq!(fs::read_to_string(remote.join("dir/a.txt")).unwrap(), "third");
+        assert_eq!(fs::metadata(remote.join("dir/a.txt")).unwrap().mode() & 0o777, 0o640);
+        fs::write(local.join("dir/a.txt"), "local copy").unwrap();
+        let replaced = download_with(&mut sftp, "test".to_owned(), &[remote.join("dir/a.txt")], &local.join("dir"), true, &no, &mut |_| {});
+        assert!(replaced.errors.is_empty(), "{:?}", replaced.errors);
+        assert_eq!(fs::read_to_string(local.join("dir/a.txt")).unwrap(), "third");
+        let leftovers = |dir: &Path| {
+            fs::read_dir(dir).unwrap().flatten().filter(|entry| entry.file_name().to_string_lossy().starts_with(".salamander-part")).count()
+        };
+        assert_eq!(leftovers(&remote.join("dir")) + leftovers(&local.join("dir")), 0);
+
         let down = download_with(&mut sftp, "test".to_owned(), &[remote.join("dir")], &back, false, &no, &mut |_| {});
         assert!(down.errors.is_empty(), "{:?}", down.errors);
-        assert_eq!(fs::read_to_string(back.join("dir/a.txt")).unwrap(), "changed");
+        assert_eq!(fs::read_to_string(back.join("dir/a.txt")).unwrap(), "third");
         assert_eq!(fs::read(back.join("dir/sub/b.bin")).unwrap(), vec![7u8; 100_000]);
         assert_eq!(fs::read_link(back.join("dir/link")).unwrap(), Path::new("a.txt"));
 

@@ -115,6 +115,19 @@ cargo deb
 sudo apt install ./target/debian/salamander-rs_*_amd64.deb
 ```
 
+Balíček `.rpm` pro AlmaLinux / RHEL 9 a 10 (GNOME):
+
+```bash
+packaging/rpm/build-rpm.sh       # → target/rpm/salamander-rs-<verze>-1.x86_64.rpm
+sudo dnf install ./salamander-rs-*.x86_64.rpm     # na AlmaLinuxu
+```
+
+Skript potřebuje `rpmbuild` a statickou `libsodium.a` (Ubuntu: `libsodium-dev`, jinak
+`SODIUM_STATIC_DIR`). libsodium je přilinkovaná staticky, takže balíček vyžaduje jen
+balíčky z BaseOS a AppStream (`gtk4` ≥ 4.12, `libarchive`, `openssh-clients`), EPEL není
+potřeba. Binárka sestavená na Ubuntu 24.04 běží i s glibc 2.34 z AlmaLinuxu 9 (novější
+symboly používá Rust jen jako volitelné).
+
 Nastavení (okno Nástroje → Nastavení…, poslední adresáře, velikost okna, sloupce,
 klávesové cesty) se ukládá
 do `~/.config/salamander-rs/config`.

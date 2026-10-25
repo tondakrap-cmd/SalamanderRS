@@ -505,7 +505,7 @@ pub(super) fn remote_activate(window: &gtk::ApplicationWindow, panel: &Panel) {
     if is_dir {
         panel.navigate(&remote::virtual_path(&connection.server.id, &remote_path));
     } else {
-        with_download(window, connection, remote_path, |window, path| open_file(window, path));
+        with_download(window, connection, remote_path, open_file);
     }
 }
 
@@ -517,7 +517,7 @@ pub(super) fn remote_view(window: &gtk::ApplicationWindow, state: &Rc<WindowStat
 
 pub(super) fn remote_open_external(window: &gtk::ApplicationWindow, state: &Rc<WindowState>) {
     if let Some((connection, remote_path, false)) = remote_cursor(state.active_panel()) {
-        with_download(window, connection, remote_path, |window, path| open_file(window, path));
+        with_download(window, connection, remote_path, open_file);
     }
 }
 
@@ -817,21 +817,11 @@ pub(super) fn remote_terminal(window: &gtk::ApplicationWindow, state: &Rc<Window
     let Some((connection, dir)) = panel_connection(window, state.active_panel()) else { return };
     let command = connection.terminal_command(&dir);
     log::log(&connection.label(), "TERMINAL", &dir.to_string_lossy());
-    for terminal in ["x-terminal-emulator", "qterminal", "konsole", "xfce4-terminal", "xterm"] {
-        let mut process = std::process::Command::new(terminal);
-        process.arg("-e").args(&command);
-        match process.spawn() {
-            Ok(mut child) => {
-                std::thread::spawn(move || {
-                    let _ = child.wait();
-                });
-                return;
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return show_error(window, &format!("Nelze spustit {terminal}: {error}")),
-        }
+    // The local working directory does not matter for ssh; HOME always exists.
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/"));
+    if let Err(message) = crate::terminal::launch(&home, Some(&command)) {
+        show_error(window, &message);
     }
-    show_error(window, "Nenalezen žádný emulátor terminálu");
 }
 
 pub(super) fn show_remote_log(window: &gtk::ApplicationWindow) {

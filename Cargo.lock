@@ -746,6 +746,7 @@ dependencies = [
  "chrono",
  "gtk4",
  "libc",
+ "pkg-config",
  "tempfile",
  "trash",
 ]
